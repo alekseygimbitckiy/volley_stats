@@ -14,6 +14,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from reid_osnet import OSNetEmbedder
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -97,9 +99,15 @@ def main() -> int:
     parser.add_argument("--vball-output-dir", default="data/processed/vball_net_raw")
     parser.add_argument("--yolo-model", default="yolov8n.pt")
     parser.add_argument("--device", default="cpu", help="Ultralytics device, for example cpu, 0, or cuda:0.")
+    parser.add_argument("--embedding-device", default="cpu", help="Torchreid device, for example cpu, 0, or cuda:0.")
     parser.add_argument("--frame-stride", type=int, default=3, help="Run player detector every N frames.")
     parser.add_argument("--max-frames", type=int, default=0, help="0 means process the whole clip.")
-    parser.add_argument("--match-threshold", type=float, default=0.65)
+    parser.add_argument(
+        "--match-threshold",
+        type=float,
+        default=1.05,
+        help="Max L2 distance for assigning a player label. Use 0 to force nearest labels.",
+    )
     parser.add_argument("--trail-length", type=int, default=45, help="Number of recent ball points to draw.")
     parser.add_argument("--max-ball-gap", type=int, default=18, help="Predict ball position through this many hidden frames.")
     parser.add_argument(
@@ -124,7 +132,8 @@ def main() -> int:
 
     layout_data = load_layout_data(Path(args.layout))
     layout = extract_layout_polygon(layout_data)
-    player_refs = load_player_embeddings(Path(args.embeddings))
+    player_refs, embedding_info = load_player_embeddings(Path(args.embeddings))
+    configure_embedding_backend(deps, embedding_info, args.embedding_device)
     external_ball_track = load_or_create_ball_track(args, video_path)
     model = deps["YOLO"](args.yolo_model)
 
@@ -201,7 +210,8 @@ def main() -> int:
                 threshold=args.match_threshold,
             )
             next_track_id = update_player_tracks(player_tracks, detections, next_track_id)
-            finalize_track_labels(player_tracks)
+            if deps.get("reid_embedder") is None:
+                finalize_track_labels(player_tracks)
             last_player_detections = detections
             player_boxes_for_ball = [det.bbox for det in last_player_detections]
 
@@ -402,7 +412,7 @@ def warn_layout_size_mismatch(layout_data: dict, video_width: int, video_height:
         )
 
 
-def load_player_embeddings(path: Path) -> list[dict[str, Any]]:
+def load_player_embeddings(path: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     data = json.loads(path.read_text(encoding="utf-8"))
     refs = []
     for player in data.get("players", []):
@@ -411,7 +421,17 @@ def load_player_embeddings(path: Path) -> list[dict[str, Any]]:
             refs.append({"player_id": player["player_id"], "embedding": [float(v) for v in embedding]})
     if not refs:
         raise SystemExit(f"No player embeddings found in {path}")
-    return refs
+    return refs, data.get("embedding", {})
+
+
+def configure_embedding_backend(deps: dict[str, Any], embedding_info: dict[str, Any], device: str) -> None:
+    embedding_type = str(embedding_info.get("type", ""))
+    deps["embedding_type"] = embedding_type
+    if embedding_type.startswith("torchreid_osnet"):
+        print(f"Loading player ReID embedder: {embedding_type} on {device}")
+        deps["reid_embedder"] = OSNetEmbedder(device=device)
+    else:
+        deps["reid_embedder"] = None
 
 
 def filter_team_candidates(
@@ -468,19 +488,46 @@ def build_player_detections(
         if crop.size == 0:
             continue
         embedding = compute_crop_embedding(deps, crop)
-        player_id, distance = match_player(embedding, player_refs, threshold)
         detections.append(
             PlayerDetection(
                 frame=frame_idx,
                 bbox=(x1, y1, x2, y2),
                 confidence=confidence,
                 embedding=embedding,
-                player_id=player_id,
-                player_distance=distance,
+                player_id=None,
+                player_distance=None,
             )
         )
-    keep_nearest_detection_per_player(detections)
+    assign_nearest_players_to_detections(detections, player_refs, threshold)
     return detections
+
+
+def assign_nearest_players_to_detections(
+    detections: list[PlayerDetection],
+    player_refs: list[dict[str, Any]],
+    threshold: float,
+) -> None:
+    for detection in detections:
+        detection.player_id = None
+        detection.player_distance = None
+
+    pairs = []
+    for ref in player_refs:
+        for detection in detections:
+            pairs.append((euclidean(detection.embedding, ref["embedding"]), ref["player_id"], detection))
+    pairs.sort(key=lambda item: item[0])
+
+    used_players = set()
+    used_detections = set()
+    for distance, player_id, detection in pairs:
+        if threshold > 0 and distance > threshold:
+            continue
+        if player_id in used_players or id(detection) in used_detections:
+            continue
+        detection.player_id = player_id
+        detection.player_distance = distance
+        used_players.add(player_id)
+        used_detections.add(id(detection))
 
 
 def keep_nearest_detection_per_player(detections: list[PlayerDetection]) -> None:
@@ -744,6 +791,9 @@ def latest_detection_near_frame(
 
 
 def compute_crop_embedding(deps: dict[str, Any], crop: Any) -> list[float]:
+    if deps.get("reid_embedder") is not None:
+        return deps["reid_embedder"].embed_bgr(deps["cv2"], crop)
+
     cv2 = deps["cv2"]
     np = deps["np"]
     resized = cv2.resize(crop, (16, 16), interpolation=cv2.INTER_AREA)
