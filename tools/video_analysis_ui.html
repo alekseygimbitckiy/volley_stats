@@ -1,0 +1,312 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Volleyball Video Analysis</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --bg: #f6f7f4;
+        --panel: #ffffff;
+        --text: #202124;
+        --muted: #626a73;
+        --line: #d7dadc;
+        --accent: #1f7a5c;
+        --accent-strong: #126345;
+        --danger: #b33232;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+        font-family:
+          Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+          sans-serif;
+      }
+
+      header {
+        border-bottom: 1px solid var(--line);
+        background: var(--panel);
+        padding: 14px 20px;
+      }
+
+      h1 {
+        margin: 0;
+        font-size: 18px;
+      }
+
+      main {
+        display: grid;
+        grid-template-columns: minmax(320px, 420px) minmax(0, 1fr);
+        gap: 16px;
+        padding: 16px;
+      }
+
+      aside,
+      .log-panel {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 14px;
+      }
+
+      section + section {
+        border-top: 1px solid var(--line);
+        margin-top: 14px;
+        padding-top: 14px;
+      }
+
+      h2 {
+        margin: 0 0 8px;
+        font-size: 13px;
+      }
+
+      p {
+        margin: 0 0 8px;
+        color: var(--muted);
+        font-size: 13px;
+        line-height: 1.45;
+      }
+
+      label {
+        display: block;
+        margin: 10px 0 6px;
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      input {
+        width: 100%;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: #fff;
+        color: var(--text);
+        font: inherit;
+        font-size: 13px;
+        padding: 8px;
+      }
+
+      .row {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 10px;
+      }
+
+      .toolbar {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-top: 12px;
+      }
+
+      button {
+        min-height: 34px;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: #fff;
+        color: var(--text);
+        cursor: pointer;
+        font: inherit;
+        font-size: 13px;
+        padding: 7px 10px;
+      }
+
+      button.primary {
+        border-color: var(--accent);
+        background: var(--accent);
+        color: #fff;
+      }
+
+      button.primary:hover {
+        background: var(--accent-strong);
+      }
+
+      button:disabled {
+        cursor: not-allowed;
+        opacity: 0.45;
+      }
+
+      pre {
+        min-height: calc(100vh - 132px);
+        max-height: calc(100vh - 132px);
+        overflow: auto;
+        margin: 0;
+        border-radius: 6px;
+        background: #171b20;
+        color: #e7edf3;
+        padding: 12px;
+        font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        white-space: pre-wrap;
+      }
+
+      .status {
+        margin-top: 10px;
+        color: var(--muted);
+        font-size: 13px;
+        line-height: 1.4;
+        white-space: pre-wrap;
+      }
+
+      .status.error {
+        color: var(--danger);
+      }
+
+      code {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 12px;
+      }
+
+      @media (max-width: 900px) {
+        main {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Volleyball Video Analysis</h1>
+    </header>
+
+    <main>
+      <aside>
+        <section>
+          <h2>Inputs</h2>
+          <label for="videosDir">Videos directory</label>
+          <input id="videosDir" value="data/game" />
+          <label for="layout">Field layout JSON</label>
+          <input id="layout" value="data/processed/calibrations/field_layout.json" />
+          <label for="embeddings">Player embeddings JSON</label>
+          <input id="embeddings" value="data/processed/player_embeddings/player_embeddings.json" />
+          <label for="ballTracksDir">Ball tracks directory</label>
+          <input id="ballTracksDir" value="data/processed/vball_net_raw" />
+        </section>
+
+        <section>
+          <h2>Models</h2>
+          <label for="yoloModel">YOLO person model</label>
+          <input id="yoloModel" value="yolov8n.pt" />
+          <label for="vballNetCommand">Optional vball-net ONNX model path or command template</label>
+          <input
+            id="vballNetCommand"
+            placeholder="example: external/vball-net/vb-models/VballNetFastV1_155_h288_w512.onnx"
+          />
+          <p>Leave empty if normalized ball-track files already exist. If this is an `.onnx` path, the local vball-net wrapper is used.</p>
+        </section>
+
+        <section>
+          <h2>Runtime</h2>
+          <div class="row">
+            <div>
+              <label for="frameStride">Frame stride</label>
+              <input id="frameStride" type="number" min="1" value="5" />
+            </div>
+            <div>
+              <label for="matchThreshold">Match threshold</label>
+              <input id="matchThreshold" type="number" min="0" max="2" step="0.01" value="0.65" />
+            </div>
+          </div>
+          <label for="limit">Video limit</label>
+          <input id="limit" type="number" min="1" placeholder="empty = all videos" />
+          <label for="outputDir">Output directory</label>
+          <input id="outputDir" value="data/processed/analysis" />
+          <div class="toolbar">
+            <button id="start" class="primary">Start Analysis</button>
+            <button id="refresh">Refresh Log</button>
+          </div>
+          <div id="status" class="status"></div>
+        </section>
+      </aside>
+
+      <div class="log-panel">
+        <pre id="log">Ready.</pre>
+      </div>
+    </main>
+
+    <script>
+      const els = {
+        videosDir: document.querySelector("#videosDir"),
+        layout: document.querySelector("#layout"),
+        embeddings: document.querySelector("#embeddings"),
+        ballTracksDir: document.querySelector("#ballTracksDir"),
+        yoloModel: document.querySelector("#yoloModel"),
+        vballNetCommand: document.querySelector("#vballNetCommand"),
+        frameStride: document.querySelector("#frameStride"),
+        matchThreshold: document.querySelector("#matchThreshold"),
+        limit: document.querySelector("#limit"),
+        outputDir: document.querySelector("#outputDir"),
+        start: document.querySelector("#start"),
+        refresh: document.querySelector("#refresh"),
+        status: document.querySelector("#status"),
+        log: document.querySelector("#log"),
+      };
+
+      let pollTimer = null;
+
+      els.start.addEventListener("click", startAnalysis);
+      els.refresh.addEventListener("click", refreshStatus);
+
+      async function startAnalysis() {
+        const payload = {
+          videos_dir: els.videosDir.value,
+          layout: els.layout.value,
+          embeddings: els.embeddings.value,
+          ball_tracks_dir: els.ballTracksDir.value,
+          yolo_model: els.yoloModel.value,
+          vball_net_command: els.vballNetCommand.value,
+          frame_stride: Number(els.frameStride.value),
+          match_threshold: Number(els.matchThreshold.value),
+          limit: els.limit.value ? Number(els.limit.value) : null,
+          output_dir: els.outputDir.value,
+        };
+
+        els.start.disabled = true;
+        setStatus("Starting analysis ...");
+        const response = await fetch("/start", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const result = await response.json();
+        if (!response.ok || !result.ok) {
+          setStatus(result.error || "Failed to start analysis.", true);
+          els.start.disabled = false;
+          return;
+        }
+        setStatus(`Running:\n${result.command}`);
+        pollTimer = setInterval(refreshStatus, 1000);
+        refreshStatus();
+      }
+
+      async function refreshStatus() {
+        const response = await fetch("/status");
+        const state = await response.json();
+        els.log.textContent = state.log || "No output yet.";
+        els.log.scrollTop = els.log.scrollHeight;
+        if (!state.running) {
+          els.start.disabled = false;
+          if (pollTimer) clearInterval(pollTimer);
+          pollTimer = null;
+          if (state.returncode === null) {
+            setStatus("Ready.");
+          } else if (state.returncode === 0) {
+            setStatus("Analysis complete.");
+          } else {
+            setStatus(`Analysis failed with exit code ${state.returncode}.`, true);
+          }
+        }
+      }
+
+      function setStatus(message, isError = false) {
+        els.status.textContent = message;
+        els.status.classList.toggle("error", isError);
+      }
+    </script>
+  </body>
+</html>

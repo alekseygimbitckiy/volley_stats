@@ -1,0 +1,733 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Player Snapshot Embeddings</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --bg: #f6f7f4;
+        --panel: #ffffff;
+        --text: #202124;
+        --muted: #626a73;
+        --line: #d7dadc;
+        --accent: #1f7a5c;
+        --accent-strong: #126345;
+        --danger: #b33232;
+        --blue: #2563b8;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+        font-family:
+          Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+          sans-serif;
+      }
+
+      header {
+        border-bottom: 1px solid var(--line);
+        background: var(--panel);
+        padding: 14px 20px;
+      }
+
+      h1 {
+        margin: 0;
+        font-size: 18px;
+        line-height: 1.3;
+      }
+
+      main {
+        display: grid;
+        grid-template-columns: minmax(300px, 380px) minmax(0, 1fr) minmax(260px, 340px);
+        gap: 16px;
+        padding: 16px;
+      }
+
+      aside,
+      .stage,
+      .samples {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+      }
+
+      aside,
+      .samples {
+        padding: 14px;
+      }
+
+      .stage {
+        min-height: calc(100vh - 92px);
+        padding: 12px;
+        overflow: auto;
+      }
+
+      section + section {
+        border-top: 1px solid var(--line);
+        margin-top: 14px;
+        padding-top: 14px;
+      }
+
+      h2 {
+        margin: 0 0 8px;
+        font-size: 13px;
+      }
+
+      p {
+        margin: 0 0 8px;
+        color: var(--muted);
+        font-size: 13px;
+        line-height: 1.45;
+      }
+
+      label {
+        display: block;
+        margin: 10px 0 6px;
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      input,
+      select {
+        width: 100%;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: #fff;
+        color: var(--text);
+        font: inherit;
+        font-size: 13px;
+        padding: 8px;
+      }
+
+      input[type="number"] {
+        max-width: 120px;
+      }
+
+      .toolbar {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-top: 10px;
+      }
+
+      button {
+        min-height: 34px;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: #fff;
+        color: var(--text);
+        cursor: pointer;
+        font: inherit;
+        font-size: 13px;
+        padding: 7px 10px;
+      }
+
+      button.primary {
+        border-color: var(--accent);
+        background: var(--accent);
+        color: #fff;
+      }
+
+      button.primary:hover {
+        background: var(--accent-strong);
+      }
+
+      button.danger {
+        border-color: #d6aaaa;
+        color: var(--danger);
+      }
+
+      button:disabled {
+        cursor: not-allowed;
+        opacity: 0.45;
+      }
+
+      .canvas-wrap {
+        width: 100%;
+        overflow: auto;
+        border-radius: 6px;
+        background: #222;
+      }
+
+      canvas {
+        display: block;
+        max-width: 100%;
+        height: auto;
+        cursor: crosshair;
+      }
+
+      video {
+        display: none;
+      }
+
+      .status,
+      .meta {
+        min-height: 20px;
+        margin-top: 10px;
+        color: var(--muted);
+        font-size: 13px;
+        line-height: 1.4;
+        white-space: pre-wrap;
+      }
+
+      .status.error {
+        color: var(--danger);
+      }
+
+      .sample-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(86px, 1fr));
+        gap: 8px;
+        max-height: calc(100vh - 238px);
+        overflow: auto;
+        padding-right: 4px;
+      }
+
+      .sample-card {
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        overflow: hidden;
+        background: #fff;
+      }
+
+      .sample-card img {
+        display: block;
+        width: 100%;
+        aspect-ratio: 3 / 4;
+        object-fit: cover;
+        background: #eee;
+      }
+
+      .sample-card div {
+        padding: 5px 6px;
+        color: var(--muted);
+        font-size: 11px;
+        line-height: 1.25;
+        overflow-wrap: anywhere;
+      }
+
+      .player-list {
+        display: grid;
+        gap: 6px;
+      }
+
+      .player-row {
+        display: flex;
+        justify-content: space-between;
+        gap: 8px;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        padding: 7px 8px;
+        font-size: 13px;
+      }
+
+      code {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 12px;
+      }
+
+      @media (max-width: 1100px) {
+        main {
+          grid-template-columns: 1fr;
+        }
+
+        .stage {
+          min-height: 520px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Player Snapshot Embeddings</h1>
+    </header>
+
+    <main>
+      <aside>
+        <section>
+          <h2>Video Source</h2>
+          <p>Select all clips from <code>data/game</code>. The UI samples random frames across all selected videos.</p>
+          <label for="videoFiles">MP4 clips</label>
+          <input id="videoFiles" type="file" accept="video/mp4,video/*" multiple />
+          <label for="samplesPerVideo">Random frames per video</label>
+          <input id="samplesPerVideo" type="number" min="1" max="20" value="3" />
+          <div class="toolbar">
+            <button id="buildQueue" class="primary" disabled>Build Queue</button>
+            <button id="nextFrame" disabled>Next Frame</button>
+          </div>
+          <div id="queueMeta" class="meta"></div>
+        </section>
+
+        <section>
+          <h2>Players</h2>
+          <p>Add player IDs or names. Select the current player, then drag a box around that player in the frame.</p>
+          <label for="newPlayer">Player ID</label>
+          <input id="newPlayer" type="text" placeholder="for example: player_1 or Sasha" />
+          <div class="toolbar">
+            <button id="addPlayer">Add Player</button>
+          </div>
+          <label for="currentPlayer">Current player</label>
+          <select id="currentPlayer"></select>
+          <div id="playerList" class="player-list"></div>
+        </section>
+
+        <section>
+          <h2>Save</h2>
+          <p>Save after you have several snapshots per player. More varied snapshots produce more stable embeddings.</p>
+          <div class="toolbar">
+            <button id="save" class="primary" disabled>Save Embeddings</button>
+            <button id="clearAll" class="danger">Clear All</button>
+          </div>
+          <div id="status" class="status"></div>
+        </section>
+      </aside>
+
+      <div class="stage">
+        <div class="canvas-wrap">
+          <canvas id="canvas"></canvas>
+        </div>
+        <video id="video" muted playsinline preload="metadata"></video>
+      </div>
+
+      <aside class="samples">
+        <section>
+          <h2>Snapshots</h2>
+          <p>Accepted crops are stored here before saving.</p>
+          <div id="sampleGrid" class="sample-grid"></div>
+        </section>
+      </aside>
+    </main>
+
+    <script>
+      const state = {
+        files: [],
+        queue: [],
+        queueIndex: -1,
+        currentTask: null,
+        selectedVideoUrl: null,
+        frameLoaded: false,
+        sourceCanvas: document.createElement("canvas"),
+        players: new Map(),
+        samples: [],
+        dragStart: null,
+        dragCurrent: null,
+      };
+
+      const els = {
+        videoFiles: document.querySelector("#videoFiles"),
+        samplesPerVideo: document.querySelector("#samplesPerVideo"),
+        buildQueue: document.querySelector("#buildQueue"),
+        nextFrame: document.querySelector("#nextFrame"),
+        queueMeta: document.querySelector("#queueMeta"),
+        newPlayer: document.querySelector("#newPlayer"),
+        addPlayer: document.querySelector("#addPlayer"),
+        currentPlayer: document.querySelector("#currentPlayer"),
+        playerList: document.querySelector("#playerList"),
+        save: document.querySelector("#save"),
+        clearAll: document.querySelector("#clearAll"),
+        status: document.querySelector("#status"),
+        sampleGrid: document.querySelector("#sampleGrid"),
+        canvas: document.querySelector("#canvas"),
+        video: document.querySelector("#video"),
+      };
+
+      const ctx = els.canvas.getContext("2d");
+      const sourceCtx = state.sourceCanvas.getContext("2d");
+
+      addPlayer("player_1");
+
+      els.videoFiles.addEventListener("change", () => {
+        state.files = Array.from(els.videoFiles.files || []).filter((file) =>
+          file.type.startsWith("video/") || file.name.toLowerCase().endsWith(".mp4"),
+        );
+        els.buildQueue.disabled = state.files.length === 0;
+        setStatus(state.files.length ? `${state.files.length} video clips selected.` : "No video clips selected.");
+      });
+
+      els.buildQueue.addEventListener("click", buildQueue);
+      els.nextFrame.addEventListener("click", loadNextFrame);
+      els.addPlayer.addEventListener("click", () => {
+        addPlayer(els.newPlayer.value.trim());
+        els.newPlayer.value = "";
+      });
+      els.newPlayer.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") {
+          addPlayer(els.newPlayer.value.trim());
+          els.newPlayer.value = "";
+        }
+      });
+      els.save.addEventListener("click", saveEmbeddings);
+      els.clearAll.addEventListener("click", () => {
+        state.players = new Map();
+        state.samples = [];
+        addPlayer("player_1");
+        renderAll();
+      });
+
+      els.canvas.addEventListener("pointerdown", (event) => {
+        if (!state.frameLoaded || !els.currentPlayer.value) return;
+        state.dragStart = eventPoint(event);
+        state.dragCurrent = state.dragStart;
+        els.canvas.setPointerCapture(event.pointerId);
+        redraw();
+      });
+
+      els.canvas.addEventListener("pointermove", (event) => {
+        if (!state.dragStart) return;
+        state.dragCurrent = eventPoint(event);
+        redraw();
+      });
+
+      els.canvas.addEventListener("pointerup", (event) => {
+        if (!state.dragStart) return;
+        state.dragCurrent = eventPoint(event);
+        const rect = normalizeRect(state.dragStart, state.dragCurrent);
+        state.dragStart = null;
+        state.dragCurrent = null;
+        redraw();
+        if (rect.width < 20 || rect.height < 30) {
+          setStatus("Crop ignored because the box was too small.", true);
+          return;
+        }
+        acceptCrop(rect);
+      });
+
+      els.video.addEventListener("loadedmetadata", () => {
+        if (!state.currentTask) return;
+        const duration = Number.isFinite(els.video.duration) ? els.video.duration : 0;
+        const minTime = duration > 2 ? 0.5 : 0;
+        const maxTime = duration > 2 ? duration - 0.5 : duration;
+        const time = maxTime > minTime ? minTime + state.currentTask.random * (maxTime - minTime) : 0;
+        state.currentTask.timeSec = time;
+        els.video.currentTime = time;
+      });
+
+      els.video.addEventListener("seeked", () => {
+        const width = els.video.videoWidth;
+        const height = els.video.videoHeight;
+        if (!width || !height) {
+          setStatus("Could not read video frame dimensions.", true);
+          return;
+        }
+
+        els.canvas.width = width;
+        els.canvas.height = height;
+        state.sourceCanvas.width = width;
+        state.sourceCanvas.height = height;
+        sourceCtx.drawImage(els.video, 0, 0, width, height);
+        state.frameLoaded = true;
+        redraw();
+        renderQueueMeta();
+        setStatus("Frame ready. Select a player and drag a box around them.");
+      });
+
+      els.video.addEventListener("error", () => {
+        setStatus("The selected video could not be decoded by the browser.", true);
+      });
+
+      function buildQueue() {
+        const perVideo = Math.max(1, Math.min(20, Number(els.samplesPerVideo.value) || 3));
+        state.queue = [];
+        state.files.forEach((file) => {
+          for (let i = 0; i < perVideo; i += 1) {
+            state.queue.push({ file, random: Math.random(), timeSec: null });
+          }
+        });
+        shuffle(state.queue);
+        state.queueIndex = -1;
+        state.currentTask = null;
+        state.frameLoaded = false;
+        els.nextFrame.disabled = state.queue.length === 0;
+        renderQueueMeta();
+        setStatus(`Queued ${state.queue.length} random frames.`);
+      }
+
+      function loadNextFrame() {
+        if (!state.queue.length) return;
+        state.queueIndex = (state.queueIndex + 1) % state.queue.length;
+        state.currentTask = state.queue[state.queueIndex];
+        if (state.selectedVideoUrl) URL.revokeObjectURL(state.selectedVideoUrl);
+        state.selectedVideoUrl = URL.createObjectURL(state.currentTask.file);
+        state.frameLoaded = false;
+        els.video.src = state.selectedVideoUrl;
+        els.video.load();
+        setStatus(`Loading ${state.currentTask.file.name} ...`);
+      }
+
+      function addPlayer(rawId) {
+        const playerId = sanitizePlayerId(rawId || `player_${state.players.size + 1}`);
+        if (!playerId) return;
+        if (!state.players.has(playerId)) {
+          state.players.set(playerId, { player_id: playerId, samples: [], embedding: [] });
+        }
+        renderPlayers();
+        els.currentPlayer.value = playerId;
+      }
+
+      function acceptCrop(rect) {
+        const playerId = els.currentPlayer.value;
+        const cropCanvas = document.createElement("canvas");
+        cropCanvas.width = rect.width;
+        cropCanvas.height = rect.height;
+        const cropCtx = cropCanvas.getContext("2d");
+        cropCtx.drawImage(state.sourceCanvas, rect.x, rect.y, rect.width, rect.height, 0, 0, rect.width, rect.height);
+
+        const embedding = computeEmbedding(cropCanvas);
+        const sample = {
+          sample_id: `sample_${String(state.samples.length + 1).padStart(4, "0")}`,
+          player_id: playerId,
+          source_video: state.currentTask.file.name,
+          time_sec: Number(state.currentTask.timeSec.toFixed(6)),
+          time_ms: Math.round(state.currentTask.timeSec * 1000),
+          bbox_px: {
+            x: rect.x,
+            y: rect.y,
+            width: rect.width,
+            height: rect.height,
+          },
+          frame_size: {
+            width: els.canvas.width,
+            height: els.canvas.height,
+          },
+          embedding,
+          crop_png: cropCanvas.toDataURL("image/png"),
+        };
+
+        state.samples.push(sample);
+        state.players.get(playerId).samples.push(sample);
+        updatePlayerEmbeddings();
+        renderAll();
+        setStatus(`Added snapshot for ${playerId}.`);
+      }
+
+      function computeEmbedding(cropCanvas) {
+        const size = 16;
+        const small = document.createElement("canvas");
+        small.width = size;
+        small.height = size;
+        const smallCtx = small.getContext("2d", { willReadFrequently: true });
+        smallCtx.drawImage(cropCanvas, 0, 0, size, size);
+        const pixels = smallCtx.getImageData(0, 0, size, size).data;
+
+        const rgbBins = new Array(24).fill(0);
+        const luma = [];
+        for (let i = 0; i < pixels.length; i += 4) {
+          const r = pixels[i];
+          const g = pixels[i + 1];
+          const b = pixels[i + 2];
+          rgbBins[Math.min(7, Math.floor(r / 32))] += 1;
+          rgbBins[8 + Math.min(7, Math.floor(g / 32))] += 1;
+          rgbBins[16 + Math.min(7, Math.floor(b / 32))] += 1;
+          luma.push((0.299 * r + 0.587 * g + 0.114 * b) / 255);
+        }
+
+        const histTotal = size * size;
+        const hist = rgbBins.map((value) => value / histTotal);
+        const pooled = [];
+        for (let y = 0; y < 8; y += 1) {
+          for (let x = 0; x < 8; x += 1) {
+            const i0 = y * 2 * size + x * 2;
+            const avg = (luma[i0] + luma[i0 + 1] + luma[i0 + size] + luma[i0 + size + 1]) / 4;
+            pooled.push(avg);
+          }
+        }
+
+        const aspect = [Math.min(3, cropCanvas.width / Math.max(1, cropCanvas.height)) / 3];
+        return l2Normalize([...hist, ...pooled, ...aspect]);
+      }
+
+      function updatePlayerEmbeddings() {
+        for (const player of state.players.values()) {
+          if (!player.samples.length) {
+            player.embedding = [];
+            continue;
+          }
+          const length = player.samples[0].embedding.length;
+          const sum = new Array(length).fill(0);
+          player.samples.forEach((sample) => {
+            sample.embedding.forEach((value, index) => {
+              sum[index] += value;
+            });
+          });
+          player.embedding = l2Normalize(sum.map((value) => value / player.samples.length));
+        }
+      }
+
+      function redraw() {
+        if (!state.frameLoaded) return;
+        ctx.clearRect(0, 0, els.canvas.width, els.canvas.height);
+        ctx.drawImage(state.sourceCanvas, 0, 0);
+        if (state.dragStart && state.dragCurrent) {
+          const rect = normalizeRect(state.dragStart, state.dragCurrent);
+          ctx.save();
+          ctx.strokeStyle = "#00e08a";
+          ctx.lineWidth = Math.max(3, Math.round(els.canvas.width / 420));
+          ctx.strokeRect(rect.x, rect.y, rect.width, rect.height);
+          ctx.fillStyle = "rgba(31, 122, 92, 0.16)";
+          ctx.fillRect(rect.x, rect.y, rect.width, rect.height);
+          ctx.restore();
+        }
+      }
+
+      async function saveEmbeddings() {
+        if (!state.samples.length) return;
+        updatePlayerEmbeddings();
+        const players = Array.from(state.players.values())
+          .filter((player) => player.samples.length)
+          .map((player) => ({
+            player_id: player.player_id,
+            sample_count: player.samples.length,
+            embedding: player.embedding,
+            sample_ids: player.samples.map((sample) => sample.sample_id),
+          }));
+
+        const payload = {
+          metadata: {
+            created_at: new Date().toISOString(),
+            selected_videos: state.files.map((file) => ({
+              name: file.name,
+              size_bytes: file.size,
+            })),
+            sample_count: state.samples.length,
+            player_count: players.length,
+          },
+          players,
+          samples: state.samples,
+        };
+
+        els.save.disabled = true;
+        setStatus("Saving snapshots and embeddings ...");
+        try {
+          const response = await fetch("/save", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+          const result = await response.json();
+          if (!response.ok || !result.ok) throw new Error(result.error || "Save failed");
+          setStatus(`Saved embeddings.\n${result.files.embeddings}\n${result.files.snapshots}`);
+        } catch (error) {
+          setStatus(error.message, true);
+        } finally {
+          els.save.disabled = state.samples.length === 0;
+        }
+      }
+
+      function renderAll() {
+        renderPlayers();
+        renderSamples();
+        renderQueueMeta();
+        els.save.disabled = state.samples.length === 0;
+      }
+
+      function renderPlayers() {
+        els.currentPlayer.innerHTML = "";
+        els.playerList.innerHTML = "";
+        for (const player of state.players.values()) {
+          const option = document.createElement("option");
+          option.value = player.player_id;
+          option.textContent = player.player_id;
+          els.currentPlayer.append(option);
+
+          const row = document.createElement("div");
+          row.className = "player-row";
+          row.innerHTML = `<span>${escapeHtml(player.player_id)}</span><span>${player.samples.length} snapshots</span>`;
+          els.playerList.append(row);
+        }
+      }
+
+      function renderSamples() {
+        els.sampleGrid.innerHTML = "";
+        state.samples.forEach((sample) => {
+          const card = document.createElement("div");
+          card.className = "sample-card";
+          const img = document.createElement("img");
+          img.src = sample.crop_png;
+          const label = document.createElement("div");
+          label.textContent = `${sample.player_id} - ${sample.source_video} @ ${sample.time_sec.toFixed(2)}s`;
+          card.append(img, label);
+          els.sampleGrid.append(card);
+        });
+      }
+
+      function renderQueueMeta() {
+        const current =
+          state.currentTask && state.frameLoaded
+            ? `Current: ${state.currentTask.file.name} @ ${state.currentTask.timeSec.toFixed(3)} sec`
+            : "Current: none";
+        els.queueMeta.textContent = `Videos: ${state.files.length}\nQueued frames: ${state.queue.length}\n${current}`;
+      }
+
+      function eventPoint(event) {
+        const rect = els.canvas.getBoundingClientRect();
+        const scaleX = els.canvas.width / rect.width;
+        const scaleY = els.canvas.height / rect.height;
+        return {
+          x: Math.round((event.clientX - rect.left) * scaleX),
+          y: Math.round((event.clientY - rect.top) * scaleY),
+        };
+      }
+
+      function normalizeRect(a, b) {
+        const x1 = clamp(Math.min(a.x, b.x), 0, els.canvas.width - 1);
+        const y1 = clamp(Math.min(a.y, b.y), 0, els.canvas.height - 1);
+        const x2 = clamp(Math.max(a.x, b.x), 1, els.canvas.width);
+        const y2 = clamp(Math.max(a.y, b.y), 1, els.canvas.height);
+        return {
+          x: x1,
+          y: y1,
+          width: x2 - x1,
+          height: y2 - y1,
+        };
+      }
+
+      function l2Normalize(values) {
+        const norm = Math.sqrt(values.reduce((sum, value) => sum + value * value, 0)) || 1;
+        return values.map((value) => Number((value / norm).toFixed(8)));
+      }
+
+      function shuffle(items) {
+        for (let i = items.length - 1; i > 0; i -= 1) {
+          const j = Math.floor(Math.random() * (i + 1));
+          [items[i], items[j]] = [items[j], items[i]];
+        }
+      }
+
+      function sanitizePlayerId(value) {
+        return String(value || "")
+          .trim()
+          .replace(/[^A-Za-z0-9_.-]+/g, "_")
+          .replace(/^_+|_+$/g, "");
+      }
+
+      function clamp(value, min, max) {
+        return Math.max(min, Math.min(max, value));
+      }
+
+      function setStatus(message, isError = false) {
+        els.status.textContent = message;
+        els.status.classList.toggle("error", isError);
+      }
+
+      function escapeHtml(value) {
+        return String(value).replace(/[&<>"']/g, (char) => {
+          const replacements = {
+            "&": "&amp;",
+            "<": "&lt;",
+            ">": "&gt;",
+            '"': "&quot;",
+            "'": "&#039;",
+          };
+          return replacements[char];
+        });
+      }
+    </script>
+  </body>
+</html>

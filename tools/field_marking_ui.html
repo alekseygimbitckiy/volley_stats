@@ -1,0 +1,584 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Volleyball Field Marking</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --bg: #f7f7f4;
+        --panel: #ffffff;
+        --text: #202124;
+        --muted: #626a73;
+        --line: #d6d9dc;
+        --accent: #1f7a5c;
+        --accent-strong: #126345;
+        --danger: #b33232;
+        --blue: #2563b8;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+        font-family:
+          Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+          sans-serif;
+      }
+
+      header {
+        border-bottom: 1px solid var(--line);
+        background: var(--panel);
+        padding: 14px 20px;
+      }
+
+      h1 {
+        margin: 0;
+        font-size: 18px;
+        line-height: 1.3;
+      }
+
+      main {
+        display: grid;
+        grid-template-columns: minmax(280px, 360px) minmax(0, 1fr);
+        gap: 16px;
+        padding: 16px;
+      }
+
+      aside,
+      .stage {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+      }
+
+      aside {
+        padding: 14px;
+      }
+
+      .stage {
+        min-height: calc(100vh - 92px);
+        padding: 12px;
+        overflow: auto;
+      }
+
+      section + section {
+        border-top: 1px solid var(--line);
+        margin-top: 14px;
+        padding-top: 14px;
+      }
+
+      h2 {
+        margin: 0 0 8px;
+        font-size: 13px;
+        letter-spacing: 0;
+      }
+
+      p {
+        margin: 0 0 8px;
+        color: var(--muted);
+        font-size: 13px;
+        line-height: 1.45;
+      }
+
+      label {
+        display: block;
+        margin: 10px 0 6px;
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      input[type="file"],
+      input[type="text"] {
+        width: 100%;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: #fff;
+        color: var(--text);
+        font: inherit;
+        font-size: 13px;
+        padding: 8px;
+      }
+
+      .toolbar {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-top: 10px;
+      }
+
+      button {
+        min-height: 34px;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: #fff;
+        color: var(--text);
+        cursor: pointer;
+        font: inherit;
+        font-size: 13px;
+        padding: 7px 10px;
+      }
+
+      button.primary {
+        border-color: var(--accent);
+        background: var(--accent);
+        color: #fff;
+      }
+
+      button.primary:hover {
+        background: var(--accent-strong);
+      }
+
+      button:disabled {
+        cursor: not-allowed;
+        opacity: 0.45;
+      }
+
+      .point-list {
+        display: grid;
+        gap: 6px;
+        margin-top: 8px;
+      }
+
+      .point-row {
+        display: grid;
+        grid-template-columns: 24px minmax(0, 1fr);
+        gap: 8px;
+        align-items: start;
+        font-size: 13px;
+      }
+
+      .badge {
+        display: inline-grid;
+        place-items: center;
+        width: 22px;
+        height: 22px;
+        border-radius: 999px;
+        background: var(--blue);
+        color: #fff;
+        font-size: 12px;
+        font-weight: 700;
+      }
+
+      .point-name {
+        color: var(--text);
+      }
+
+      .point-coord {
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .status {
+        min-height: 20px;
+        margin-top: 10px;
+        color: var(--muted);
+        font-size: 13px;
+        line-height: 1.4;
+        white-space: pre-wrap;
+      }
+
+      .status.error {
+        color: var(--danger);
+      }
+
+      .canvas-wrap {
+        position: relative;
+        width: 100%;
+        overflow: auto;
+        border-radius: 6px;
+        background: #222;
+      }
+
+      canvas {
+        display: block;
+        max-width: 100%;
+        height: auto;
+        cursor: crosshair;
+      }
+
+      video {
+        display: none;
+      }
+
+      code {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 12px;
+      }
+
+      .meta {
+        display: grid;
+        gap: 4px;
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      @media (max-width: 900px) {
+        main {
+          grid-template-columns: 1fr;
+        }
+
+        .stage {
+          min-height: 480px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Volleyball Field Marking</h1>
+    </header>
+
+    <main>
+      <aside>
+        <section>
+          <h2>Video Source</h2>
+          <p>Select the clips from <code>data/game</code>. The browser will choose one random video and one random frame.</p>
+          <label for="videoFiles">MP4 clips</label>
+          <input id="videoFiles" type="file" accept="video/mp4,video/*" multiple />
+          <div class="toolbar">
+            <button id="loadRandom" class="primary" disabled>Random Frame</button>
+            <button id="redraw" disabled>Redraw</button>
+          </div>
+          <div id="videoMeta" class="meta"></div>
+        </section>
+
+        <section>
+          <h2>Boundary Points</h2>
+          <p>Click four corners of the near-side court boundary in order. The polygon will be reused as the tracking mask for every clip.</p>
+          <div class="point-list" id="pointList"></div>
+          <div class="toolbar">
+            <button id="undo" disabled>Undo</button>
+            <button id="clear" disabled>Clear</button>
+          </div>
+        </section>
+
+        <section>
+          <h2>Save Template</h2>
+          <label for="cameraSetupId">Camera setup ID</label>
+          <input id="cameraSetupId" type="text" value="main_static_endline" />
+          <div class="toolbar">
+            <button id="save" class="primary" disabled>Save Layout</button>
+          </div>
+          <div id="status" class="status"></div>
+        </section>
+      </aside>
+
+      <div class="stage">
+        <div class="canvas-wrap">
+          <canvas id="canvas"></canvas>
+        </div>
+        <video id="video" muted playsinline preload="metadata"></video>
+      </div>
+    </main>
+
+    <script>
+      const pointLabels = [
+        "near-left boundary corner",
+        "near-right boundary corner",
+        "far-right boundary corner near net",
+        "far-left boundary corner near net",
+      ];
+
+      const state = {
+        files: [],
+        selectedFile: null,
+        selectedVideoUrl: null,
+        selectedTimeSec: null,
+        sourceCanvas: document.createElement("canvas"),
+        points: [],
+        frameLoaded: false,
+      };
+
+      const els = {
+        videoFiles: document.querySelector("#videoFiles"),
+        loadRandom: document.querySelector("#loadRandom"),
+        redraw: document.querySelector("#redraw"),
+        videoMeta: document.querySelector("#videoMeta"),
+        pointList: document.querySelector("#pointList"),
+        undo: document.querySelector("#undo"),
+        clear: document.querySelector("#clear"),
+        save: document.querySelector("#save"),
+        status: document.querySelector("#status"),
+        cameraSetupId: document.querySelector("#cameraSetupId"),
+        canvas: document.querySelector("#canvas"),
+        video: document.querySelector("#video"),
+      };
+
+      const ctx = els.canvas.getContext("2d");
+      const sourceCtx = state.sourceCanvas.getContext("2d");
+
+      renderPointList();
+
+      els.videoFiles.addEventListener("change", () => {
+        state.files = Array.from(els.videoFiles.files || []).filter((file) =>
+          file.type.startsWith("video/") || file.name.toLowerCase().endsWith(".mp4"),
+        );
+        setStatus(state.files.length ? `${state.files.length} video clips selected.` : "No video clips selected.");
+        els.loadRandom.disabled = state.files.length === 0;
+      });
+
+      els.loadRandom.addEventListener("click", loadRandomFrame);
+      els.redraw.addEventListener("click", redraw);
+      els.undo.addEventListener("click", () => {
+        state.points.pop();
+        redraw();
+      });
+      els.clear.addEventListener("click", () => {
+        state.points = [];
+        redraw();
+      });
+      els.save.addEventListener("click", saveLayout);
+
+      els.canvas.addEventListener("click", (event) => {
+        if (!state.frameLoaded || state.points.length >= 4) return;
+        const rect = els.canvas.getBoundingClientRect();
+        const scaleX = els.canvas.width / rect.width;
+        const scaleY = els.canvas.height / rect.height;
+        const x = Math.round((event.clientX - rect.left) * scaleX);
+        const y = Math.round((event.clientY - rect.top) * scaleY);
+        state.points.push({ x, y, label: pointLabels[state.points.length] });
+        redraw();
+      });
+
+      function loadRandomFrame() {
+        if (!state.files.length) return;
+        if (state.selectedVideoUrl) URL.revokeObjectURL(state.selectedVideoUrl);
+
+        state.selectedFile = state.files[Math.floor(Math.random() * state.files.length)];
+        state.selectedVideoUrl = URL.createObjectURL(state.selectedFile);
+        state.selectedTimeSec = null;
+        state.points = [];
+        state.frameLoaded = false;
+        els.video.src = state.selectedVideoUrl;
+        els.video.load();
+        setStatus(`Loading ${state.selectedFile.name} ...`);
+      }
+
+      els.video.addEventListener("loadedmetadata", () => {
+        const duration = Number.isFinite(els.video.duration) ? els.video.duration : 0;
+        const minTime = duration > 2 ? 0.5 : 0;
+        const maxTime = duration > 2 ? duration - 0.5 : duration;
+        state.selectedTimeSec = maxTime > minTime ? minTime + Math.random() * (maxTime - minTime) : 0;
+        els.video.currentTime = state.selectedTimeSec;
+      });
+
+      els.video.addEventListener("seeked", () => {
+        const width = els.video.videoWidth;
+        const height = els.video.videoHeight;
+        if (!width || !height) {
+          setStatus("Could not read video frame dimensions.", true);
+          return;
+        }
+
+        els.canvas.width = width;
+        els.canvas.height = height;
+        state.sourceCanvas.width = width;
+        state.sourceCanvas.height = height;
+        sourceCtx.drawImage(els.video, 0, 0, width, height);
+        state.frameLoaded = true;
+        redraw();
+      });
+
+      els.video.addEventListener("error", () => {
+        setStatus("The selected video could not be decoded by the browser.", true);
+      });
+
+      function redraw() {
+        if (!state.frameLoaded) return;
+        ctx.clearRect(0, 0, els.canvas.width, els.canvas.height);
+        ctx.drawImage(state.sourceCanvas, 0, 0);
+
+        drawMask();
+        drawPoints();
+        renderPointList();
+        renderMeta();
+        els.redraw.disabled = false;
+        els.undo.disabled = state.points.length === 0;
+        els.clear.disabled = state.points.length === 0;
+        els.save.disabled = state.points.length !== 4;
+      }
+
+      function drawMask() {
+        if (!state.points.length) return;
+
+        ctx.save();
+        ctx.lineJoin = "round";
+        ctx.lineCap = "round";
+
+        if (state.points.length >= 3) {
+          ctx.beginPath();
+          ctx.moveTo(state.points[0].x, state.points[0].y);
+          for (const point of state.points.slice(1)) ctx.lineTo(point.x, point.y);
+          if (state.points.length === 4) ctx.closePath();
+          ctx.fillStyle = "rgba(31, 122, 92, 0.18)";
+          ctx.fill();
+        }
+
+        ctx.beginPath();
+        ctx.moveTo(state.points[0].x, state.points[0].y);
+        for (const point of state.points.slice(1)) ctx.lineTo(point.x, point.y);
+        if (state.points.length === 4) ctx.closePath();
+        ctx.strokeStyle = "#00e08a";
+        ctx.lineWidth = Math.max(3, Math.round(els.canvas.width / 420));
+        ctx.stroke();
+
+        ctx.restore();
+      }
+
+      function drawPoints() {
+        const radius = Math.max(8, Math.round(els.canvas.width / 120));
+        ctx.save();
+        ctx.font = `${Math.max(13, Math.round(els.canvas.width / 85))}px sans-serif`;
+        ctx.textBaseline = "middle";
+
+        state.points.forEach((point, index) => {
+          ctx.beginPath();
+          ctx.arc(point.x, point.y, radius, 0, Math.PI * 2);
+          ctx.fillStyle = "#2563b8";
+          ctx.fill();
+          ctx.lineWidth = 2;
+          ctx.strokeStyle = "#ffffff";
+          ctx.stroke();
+          ctx.fillStyle = "#ffffff";
+          ctx.textAlign = "center";
+          ctx.fillText(String(index + 1), point.x, point.y + 1);
+
+          ctx.textAlign = "left";
+          ctx.fillStyle = "#ffffff";
+          ctx.strokeStyle = "rgba(0,0,0,0.65)";
+          ctx.lineWidth = 4;
+          const label = pointLabels[index];
+          const labelX = point.x + radius + 6;
+          const labelY = point.y;
+          ctx.strokeText(label, labelX, labelY);
+          ctx.fillText(label, labelX, labelY);
+        });
+
+        ctx.restore();
+      }
+
+      function renderPointList() {
+        els.pointList.innerHTML = "";
+        pointLabels.forEach((label, index) => {
+          const row = document.createElement("div");
+          row.className = "point-row";
+
+          const badge = document.createElement("div");
+          badge.className = "badge";
+          badge.textContent = String(index + 1);
+
+          const text = document.createElement("div");
+          const name = document.createElement("div");
+          name.className = "point-name";
+          name.textContent = label;
+          const coord = document.createElement("div");
+          coord.className = "point-coord";
+          const point = state.points[index];
+          coord.textContent = point ? `x=${point.x}, y=${point.y}` : "not marked";
+          text.append(name, coord);
+          row.append(badge, text);
+          els.pointList.append(row);
+        });
+      }
+
+      function renderMeta() {
+        if (!state.selectedFile || !state.frameLoaded) {
+          els.videoMeta.innerHTML = "";
+          return;
+        }
+        els.videoMeta.innerHTML = `
+          <div><strong>Video:</strong> ${escapeHtml(state.selectedFile.name)}</div>
+          <div><strong>Random time:</strong> ${state.selectedTimeSec.toFixed(3)} sec</div>
+          <div><strong>Frame size:</strong> ${els.canvas.width} x ${els.canvas.height}</div>
+        `;
+        setStatus(
+          state.points.length < 4
+            ? `Frame ready. Click point ${state.points.length + 1}: ${pointLabels[state.points.length]}.`
+            : "Boundary complete. Save the layout template when ready.",
+        );
+      }
+
+      async function saveLayout() {
+        if (state.points.length !== 4) return;
+
+        const metadata = {
+          schema_version: 1,
+          camera_setup_id: els.cameraSetupId.value.trim() || "main_static_endline",
+          source_video: {
+            name: state.selectedFile.name,
+            size_bytes: state.selectedFile.size,
+            selected_time_sec: Number(state.selectedTimeSec.toFixed(6)),
+          },
+          frame: {
+            width_px: els.canvas.width,
+            height_px: els.canvas.height,
+          },
+          near_side_boundary_px: state.points.map((point, index) => ({
+            order: index + 1,
+            label: point.label,
+            x: point.x,
+            y: point.y,
+          })),
+          all_selected_videos: state.files.map((file) => ({
+            name: file.name,
+            size_bytes: file.size,
+          })),
+          usage: {
+            mask: "Use near_side_boundary_px as the near-side tracking polygon for every clip from this stationary camera.",
+            point_order: "near-left, near-right, far-right near net, far-left near net",
+          },
+          created_at: new Date().toISOString(),
+        };
+
+        const payload = {
+          metadata,
+          annotated_png: els.canvas.toDataURL("image/png"),
+          frame_png: state.sourceCanvas.toDataURL("image/png"),
+        };
+
+        els.save.disabled = true;
+        setStatus("Saving layout template ...");
+        try {
+          const response = await fetch("/save", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+          const result = await response.json();
+          if (!response.ok || !result.ok) throw new Error(result.error || "Save failed");
+          setStatus(
+            `Saved layout template.\n${result.files.layout}\n${result.files.annotated_frame}\n${result.files.source_frame}`,
+          );
+        } catch (error) {
+          setStatus(error.message, true);
+        } finally {
+          els.save.disabled = state.points.length !== 4;
+        }
+      }
+
+      function setStatus(message, isError = false) {
+        els.status.textContent = message;
+        els.status.classList.toggle("error", isError);
+      }
+
+      function escapeHtml(value) {
+        return String(value).replace(/[&<>"']/g, (char) => {
+          const replacements = {
+            "&": "&amp;",
+            "<": "&lt;",
+            ">": "&gt;",
+            '"': "&quot;",
+            "'": "&#039;",
+          };
+          return replacements[char];
+        });
+      }
+    </script>
+  </body>
+</html>
