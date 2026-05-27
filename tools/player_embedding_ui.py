@@ -26,6 +26,9 @@ class PlayerEmbeddingHandler(BaseHTTPRequestHandler):
         if parsed.path in ("/", "/player_embedding_ui.html"):
             self._send_file(HTML_FILE)
             return
+        if parsed.path == "/existing":
+            self._send_json(self._load_existing())
+            return
         self.send_error(404, "Not found")
 
     def do_POST(self) -> None:
@@ -83,12 +86,20 @@ class PlayerEmbeddingHandler(BaseHTTPRequestHandler):
             player_dir = snapshot_root / player_id
             player_dir.mkdir(parents=True, exist_ok=True)
 
-            file_name = f"{index:04d}_{_safe_name(sample['source_video'])}_{sample['time_ms']}ms.png"
-            path = player_dir / file_name
-            _write_data_url_png(path, sample["crop_png"])
-
             sample_metadata = dict(sample)
+            existing_path = sample_metadata.get("snapshot_path")
+            if sample_metadata.get("existing") and existing_path and Path(existing_path).exists():
+                path = Path(existing_path)
+            else:
+                file_name = (
+                    f"{index:04d}_{_safe_name(sample_metadata.get('sample_id', 'sample'))}_"
+                    f"{_safe_name(sample['source_video'])}_{sample['time_ms']}ms.png"
+                )
+                path = player_dir / file_name
+                _write_data_url_png(path, sample["crop_png"])
+
             sample_metadata.pop("crop_png", None)
+            sample_metadata.pop("existing", None)
             sample_metadata["snapshot_path"] = str(path)
             saved_samples.append(sample_metadata)
 
@@ -119,12 +130,40 @@ class PlayerEmbeddingHandler(BaseHTTPRequestHandler):
             "snapshots": str(snapshot_root),
         }
 
+    def _load_existing(self) -> dict:
+        embeddings_path = OUTPUT_DIR / "player_embeddings.json"
+        if not embeddings_path.exists():
+            return {"ok": True, "exists": False, "players": [], "samples": []}
+
+        data = json.loads(embeddings_path.read_text(encoding="utf-8"))
+        samples = []
+        for sample in data.get("samples", []):
+            sample_copy = dict(sample)
+            snapshot_path = Path(sample_copy.get("snapshot_path", ""))
+            if snapshot_path.exists():
+                sample_copy["crop_png"] = _read_png_data_url(snapshot_path)
+                sample_copy["existing"] = True
+                samples.append(sample_copy)
+
+        return {
+            "ok": True,
+            "exists": True,
+            "players": data.get("players", []),
+            "samples": samples,
+            "embedding": data.get("embedding", {}),
+            "saved_files": data.get("saved_files", {}),
+        }
+
 
 def _write_data_url_png(path: Path, data_url: str) -> None:
     prefix = "data:image/png;base64,"
     if not data_url.startswith(prefix):
         raise ValueError(f"Expected PNG data URL for {path.name}")
     path.write_bytes(base64.b64decode(data_url[len(prefix) :]))
+
+
+def _read_png_data_url(path: Path) -> str:
+    return "data:image/png;base64," + base64.b64encode(path.read_bytes()).decode("ascii")
 
 
 def _safe_name(value: str) -> str:

@@ -191,10 +191,23 @@
       }
 
       .sample-card {
+        position: relative;
         border: 1px solid var(--line);
         border-radius: 6px;
         overflow: hidden;
         background: #fff;
+      }
+
+      .sample-card .remove-sample {
+        position: absolute;
+        top: 4px;
+        right: 4px;
+        min-height: 24px;
+        border-color: rgba(179, 50, 50, 0.45);
+        background: rgba(255, 255, 255, 0.92);
+        color: var(--danger);
+        font-size: 12px;
+        padding: 2px 7px;
       }
 
       .sample-card img {
@@ -315,7 +328,10 @@
         frameLoaded: false,
         sourceCanvas: document.createElement("canvas"),
         players: new Map(),
+        currentPlayerId: "",
         samples: [],
+        nextSampleNumber: 1,
+        allowSave: false,
         dragStart: null,
         dragCurrent: null,
       };
@@ -341,7 +357,7 @@
       const ctx = els.canvas.getContext("2d");
       const sourceCtx = state.sourceCanvas.getContext("2d");
 
-      addPlayer("player_1");
+      loadExisting();
 
       els.videoFiles.addEventListener("change", () => {
         state.files = Array.from(els.videoFiles.files || []).filter((file) =>
@@ -353,6 +369,9 @@
 
       els.buildQueue.addEventListener("click", buildQueue);
       els.nextFrame.addEventListener("click", loadNextFrame);
+      els.currentPlayer.addEventListener("change", () => {
+        state.currentPlayerId = els.currentPlayer.value;
+      });
       els.addPlayer.addEventListener("click", () => {
         addPlayer(els.newPlayer.value.trim());
         els.newPlayer.value = "";
@@ -367,6 +386,8 @@
       els.clearAll.addEventListener("click", () => {
         state.players = new Map();
         state.samples = [];
+        state.nextSampleNumber = 1;
+        state.allowSave = true;
         addPlayer("player_1");
         renderAll();
       });
@@ -451,6 +472,7 @@
 
       function loadNextFrame() {
         if (!state.queue.length) return;
+        rememberCurrentPlayer();
         state.queueIndex = (state.queueIndex + 1) % state.queue.length;
         state.currentTask = state.queue[state.queueIndex];
         if (state.selectedVideoUrl) URL.revokeObjectURL(state.selectedVideoUrl);
@@ -468,11 +490,12 @@
           state.players.set(playerId, { player_id: playerId, samples: [], embedding: [] });
         }
         renderPlayers();
-        els.currentPlayer.value = playerId;
+        setCurrentPlayer(playerId);
       }
 
       function acceptCrop(rect) {
-        const playerId = els.currentPlayer.value;
+        rememberCurrentPlayer();
+        const playerId = state.currentPlayerId || els.currentPlayer.value;
         const cropCanvas = document.createElement("canvas");
         cropCanvas.width = rect.width;
         cropCanvas.height = rect.height;
@@ -481,7 +504,7 @@
 
         const embedding = computeEmbedding(cropCanvas);
         const sample = {
-          sample_id: `sample_${String(state.samples.length + 1).padStart(4, "0")}`,
+          sample_id: nextSampleId(),
           player_id: playerId,
           source_video: state.currentTask.file.name,
           time_sec: Number(state.currentTask.timeSec.toFixed(6)),
@@ -498,10 +521,13 @@
           },
           embedding,
           crop_png: cropCanvas.toDataURL("image/png"),
+          existing: false,
         };
 
         state.samples.push(sample);
         state.players.get(playerId).samples.push(sample);
+        state.allowSave = true;
+        setCurrentPlayer(playerId);
         updatePlayerEmbeddings();
         renderAll();
         setStatus(`Added snapshot for ${playerId}.`);
@@ -545,18 +571,20 @@
 
       function updatePlayerEmbeddings() {
         for (const player of state.players.values()) {
-          if (!player.samples.length) {
+          const compatibleSamples = player.samples.filter((sample) => sample.embedding && sample.embedding.length > 0);
+          if (!compatibleSamples.length) {
             player.embedding = [];
             continue;
           }
-          const length = player.samples[0].embedding.length;
+          const length = compatibleSamples[0].embedding.length;
+          const samples = compatibleSamples.filter((sample) => sample.embedding.length === length);
           const sum = new Array(length).fill(0);
-          player.samples.forEach((sample) => {
+          samples.forEach((sample) => {
             sample.embedding.forEach((value, index) => {
               sum[index] += value;
             });
           });
-          player.embedding = l2Normalize(sum.map((value) => value / player.samples.length));
+          player.embedding = l2Normalize(sum.map((value) => value / samples.length));
         }
       }
 
@@ -577,7 +605,7 @@
       }
 
       async function saveEmbeddings() {
-        if (!state.samples.length) return;
+        if (!state.samples.length && !state.allowSave) return;
         updatePlayerEmbeddings();
         const players = Array.from(state.players.values())
           .filter((player) => player.samples.length)
@@ -612,11 +640,12 @@
           });
           const result = await response.json();
           if (!response.ok || !result.ok) throw new Error(result.error || "Save failed");
+          await loadExisting(false);
           setStatus(`Saved embeddings.\n${result.files.embeddings}\n${result.files.snapshots}`);
         } catch (error) {
           setStatus(error.message, true);
         } finally {
-          els.save.disabled = state.samples.length === 0;
+          els.save.disabled = !state.allowSave && state.samples.length === 0;
         }
       }
 
@@ -624,10 +653,11 @@
         renderPlayers();
         renderSamples();
         renderQueueMeta();
-        els.save.disabled = state.samples.length === 0;
+        els.save.disabled = !state.allowSave && state.samples.length === 0;
       }
 
       function renderPlayers() {
+        const selectedPlayerId = state.currentPlayerId || els.currentPlayer.value;
         els.currentPlayer.innerHTML = "";
         els.playerList.innerHTML = "";
         for (const player of state.players.values()) {
@@ -641,6 +671,14 @@
           row.innerHTML = `<span>${escapeHtml(player.player_id)}</span><span>${player.samples.length} snapshots</span>`;
           els.playerList.append(row);
         }
+        if (selectedPlayerId && state.players.has(selectedPlayerId)) {
+          els.currentPlayer.value = selectedPlayerId;
+          state.currentPlayerId = selectedPlayerId;
+        } else {
+          const firstPlayer = state.players.keys().next().value || "";
+          els.currentPlayer.value = firstPlayer;
+          state.currentPlayerId = firstPlayer;
+        }
       }
 
       function renderSamples() {
@@ -650,11 +688,86 @@
           card.className = "sample-card";
           const img = document.createElement("img");
           img.src = sample.crop_png;
+          const remove = document.createElement("button");
+          remove.className = "remove-sample";
+          remove.type = "button";
+          remove.textContent = "Remove";
+          remove.addEventListener("click", () => removeSample(sample.sample_id));
           const label = document.createElement("div");
-          label.textContent = `${sample.player_id} - ${sample.source_video} @ ${sample.time_sec.toFixed(2)}s`;
-          card.append(img, label);
+          const source = sample.existing ? "saved" : "new";
+          label.textContent = `${sample.player_id} - ${source} - ${sample.source_video} @ ${sample.time_sec.toFixed(2)}s`;
+          card.append(img, remove, label);
           els.sampleGrid.append(card);
         });
+      }
+
+      async function loadExisting(announce = true) {
+        try {
+          const response = await fetch("/existing");
+          const result = await response.json();
+          if (!response.ok || !result.ok) throw new Error(result.error || "Could not load saved snapshots");
+          state.players = new Map();
+          state.samples = [];
+          state.allowSave = Boolean(result.exists && ((result.samples || []).length || (result.players || []).length));
+
+          (result.players || []).forEach((player) => {
+            const playerId = sanitizePlayerId(player.player_id);
+            if (playerId) {
+              state.players.set(playerId, {
+                player_id: playerId,
+                samples: [],
+                embedding: Array.isArray(player.embedding) ? player.embedding : [],
+              });
+            }
+          });
+
+          (result.samples || []).forEach((sample) => {
+            const playerId = sanitizePlayerId(sample.player_id);
+            if (!playerId || !sample.crop_png) return;
+            if (!state.players.has(playerId)) {
+              state.players.set(playerId, { player_id: playerId, samples: [], embedding: [] });
+            }
+            const loaded = {
+              ...sample,
+              player_id: playerId,
+              embedding: Array.isArray(sample.embedding) && sample.embedding.length === 89 ? sample.embedding : [],
+              existing: true,
+            };
+            state.samples.push(loaded);
+            state.players.get(playerId).samples.push(loaded);
+          });
+
+          const maxSampleNumber = Math.max(0, ...state.samples.map(sampleNumber));
+          state.nextSampleNumber = maxSampleNumber + 1;
+
+          if (!state.players.size) {
+            addPlayer("player_1");
+          } else {
+            setCurrentPlayer(state.players.keys().next().value);
+            renderAll();
+            if (announce) {
+              setStatus(`Loaded ${state.samples.length} saved snapshots. You can remove samples or add new ones.`);
+            }
+          }
+        } catch (error) {
+          addPlayer("player_1");
+          if (announce) {
+            setStatus(error.message, true);
+          }
+        }
+      }
+
+      function removeSample(sampleId) {
+        const sample = state.samples.find((item) => item.sample_id === sampleId);
+        state.samples = state.samples.filter((item) => item.sample_id !== sampleId);
+        if (sample && state.players.has(sample.player_id)) {
+          const player = state.players.get(sample.player_id);
+          player.samples = player.samples.filter((item) => item.sample_id !== sampleId);
+        }
+        state.allowSave = true;
+        updatePlayerEmbeddings();
+        renderAll();
+        setStatus(`Removed ${sampleId} from the current embedding set. Saved image files are left on disk.`);
       }
 
       function renderQueueMeta() {
@@ -705,6 +818,28 @@
           .trim()
           .replace(/[^A-Za-z0-9_.-]+/g, "_")
           .replace(/^_+|_+$/g, "");
+      }
+
+      function nextSampleId() {
+        const id = `sample_${String(state.nextSampleNumber).padStart(4, "0")}`;
+        state.nextSampleNumber += 1;
+        return id;
+      }
+
+      function sampleNumber(sample) {
+        const match = String(sample.sample_id || "").match(/(\d+)$/);
+        return match ? Number(match[1]) : 0;
+      }
+
+      function rememberCurrentPlayer() {
+        if (els.currentPlayer.value) {
+          state.currentPlayerId = els.currentPlayer.value;
+        }
+      }
+
+      function setCurrentPlayer(playerId) {
+        state.currentPlayerId = playerId;
+        els.currentPlayer.value = playerId;
       }
 
       function clamp(value, min, max) {

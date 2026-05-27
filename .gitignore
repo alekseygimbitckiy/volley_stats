@@ -1,4 +1,6 @@
 data/
+data*
 venv/
 *.pt
 external/
+

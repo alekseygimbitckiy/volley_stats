@@ -11,7 +11,13 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class OSNetEmbedder:
-    def __init__(self, device: str = "cpu", model_name: str = "osnet_x1_0") -> None:
+    def __init__(
+        self,
+        device: str = "cpu",
+        model_name: str = "osnet_x1_0",
+        checkpoint_path: str | Path | None = None,
+        pretrained: bool = True,
+    ) -> None:
         os.environ.setdefault("TORCH_HOME", str(ROOT / ".cache" / "torch"))
         os.environ.setdefault("MPLCONFIGDIR", str(ROOT / ".cache" / "matplotlib"))
 
@@ -20,7 +26,9 @@ class OSNetEmbedder:
 
         self.torch = torch
         self.device = normalize_device(device, torch)
-        self.model = models.build_model(model_name, num_classes=1000, pretrained=True)
+        self.model = models.build_model(model_name, num_classes=1000, pretrained=pretrained and checkpoint_path is None)
+        if checkpoint_path is not None:
+            load_checkpoint_weights(torch, self.model, resolve_project_path(checkpoint_path))
         self.model.eval()
         self.model.to(self.device)
         self.model_name = model_name
@@ -46,3 +54,51 @@ def normalize_device(device: str, torch: Any) -> str:
     if device in ("cuda", "cuda:0", "0") and torch.cuda.is_available():
         return "cuda:0"
     return "cpu"
+
+
+def resolve_project_path(path: str | Path) -> Path:
+    candidate = Path(path).expanduser()
+    if candidate.is_absolute():
+        return candidate
+    return (ROOT / candidate).resolve()
+
+
+def load_checkpoint_weights(torch: Any, model: Any, path: Path) -> None:
+    if not path.exists():
+        raise FileNotFoundError(
+            f"ReID checkpoint not found: {path}\n"
+            "Download it with: ./venv/bin/python tools/download_soccernet_reid_model.py"
+        )
+    checkpoint = torch.load(str(path), map_location="cpu", weights_only=False)
+    state_dict = extract_state_dict(checkpoint)
+    model_state = model.state_dict()
+    compatible = {}
+    skipped = []
+    for key, value in state_dict.items():
+        clean_key = clean_state_key(key)
+        if clean_key in model_state and tuple(model_state[clean_key].shape) == tuple(value.shape):
+            compatible[clean_key] = value
+        else:
+            skipped.append(clean_key)
+    model.load_state_dict(compatible, strict=False)
+    print(f"Loaded {len(compatible)} ReID tensors from {path}")
+    if skipped:
+        print(f"Skipped {len(skipped)} incompatible checkpoint tensors")
+
+
+def extract_state_dict(checkpoint: Any) -> dict[str, Any]:
+    if isinstance(checkpoint, dict):
+        for key in ("state_dict", "model_state_dict", "model", "net"):
+            value = checkpoint.get(key)
+            if isinstance(value, dict):
+                return value
+        if all(hasattr(value, "shape") for value in checkpoint.values()):
+            return checkpoint
+    raise ValueError("Unsupported ReID checkpoint format")
+
+
+def clean_state_key(key: str) -> str:
+    for prefix in ("module.", "model.", "net."):
+        if key.startswith(prefix):
+            return key[len(prefix) :]
+    return key
