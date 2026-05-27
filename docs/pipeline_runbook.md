@@ -45,10 +45,10 @@ If port `8765` is busy, use another port:
 
 ## 2. Prepare Roster
 
-Create or edit a roster file with the real players. For `volleydzen.mp4`, use:
+Create or edit a roster file with the real players. For the example above, use:
 
 ```text
-data/config/volleydzen_roster.json
+$ROSTER
 ```
 
 The file should contain one player per jersey number. Example format:
@@ -66,14 +66,14 @@ The file should contain one player per jersey number. Example format:
 
 This samples random frames, detects the six near-side players, reads jersey numbers with OCR, saves confident crops, and builds OSNet embeddings.
 
-For `volleydzen.mp4`:
+For the selected video:
 
 ```bash
-./venv/bin/python tools/bootstrap_jersey_players.py data/game/volleydzen.mp4 \
+./venv/bin/python tools/bootstrap_jersey_players.py "$VIDEO" \
   --frames 200 \
   --team-filter court-nearest-6 \
   --identity-types number \
-  --roster data/config/volleydzen_roster.json \
+  --roster "$ROSTER" \
   --ocr-backend paddleocr \
   --ocr-languages en \
   --ocr-min-confidence 0.85 \
@@ -81,16 +81,46 @@ For `volleydzen.mp4`:
   --embedding-backend soccernet-osnet \
   --embedding-device cpu \
   --ocr-device cpu \
-  --output data/processed/volleydzen_jersey_embeddings/player_embeddings.json \
-  --snapshot-dir data/processed/volleydzen_jersey_embeddings/snapshots \
+  --output "$EMBEDDINGS" \
+  --snapshot-dir "$SNAPSHOTS" \
   --fresh
 ```
 
 Outputs:
 
 ```text
-data/processed/volleydzen_jersey_embeddings/player_embeddings.json
-data/processed/volleydzen_jersey_embeddings/snapshots/
+$EMBEDDINGS
+$SNAPSHOTS/
+```
+
+## 3b. Optional Manual Player Snapshot Fixes
+
+If automatic bootstrapping misses a player or saves weak crops, you can add or remove snapshots manually:
+
+```bash
+./venv/bin/python tools/player_embedding_ui.py \
+  --video "$VIDEO" \
+  --output "$EMBEDDINGS" \
+  --snapshot-dir "$SNAPSHOTS" \
+  --host 127.0.0.1 \
+  --port 8767
+```
+
+Open:
+
+```text
+http://127.0.0.1:8767/
+```
+
+Use player IDs from the roster, for example `jersey_10`, `jersey_11`, `jersey_12`.
+After manual changes, rebuild OSNet embeddings before running video labeling:
+
+```bash
+./venv/bin/python tools/rebuild_player_embeddings_osnet.py \
+  --input "$EMBEDDINGS" \
+  --output "$EMBEDDINGS" \
+  --backend soccernet-osnet \
+  --device cpu
 ```
 
 ## 4. Run Ball Tracking
@@ -98,7 +128,7 @@ data/processed/volleydzen_jersey_embeddings/snapshots/
 Run vball-net and save the ball track:
 
 ```bash
-./venv/bin/python tools/run_vball_net.py data/game/volleydzen.mp4 \
+./venv/bin/python tools/run_vball_net.py "$VIDEO" \
   --model-path external/vball-net/vb-models/VballNetFastV1_155_h288_w512.onnx \
   --output-dir data/processed/vball_net_raw
 ```
@@ -106,18 +136,18 @@ Run vball-net and save the ball track:
 Outputs:
 
 ```text
-data/processed/vball_net_raw/volleydzen.csv
-data/processed/vball_net_raw/volleydzen.json
+$BALL_TRACK
+data/processed/vball_net_raw/$STEM.json
 ```
 
 ## 5. Label Video
 
-This is the best current command for player marking on `volleydzen.mp4`:
+This is the best current command format for player marking:
 
 ```bash
-./venv/bin/python tools/test_track_video.py data/game/volleydzen.mp4 \
-  --embeddings data/processed/volleydzen_jersey_embeddings/player_embeddings.json \
-  --ball-track data/processed/vball_net_raw/volleydzen.csv \
+./venv/bin/python tools/test_track_video.py "$VIDEO" \
+  --embeddings "$EMBEDDINGS" \
+  --ball-track "$BALL_TRACK" \
   --team-filter court-nearest-6 \
   --fill-roster-labels \
   --predict-missing-players \
@@ -126,7 +156,7 @@ This is the best current command for player marking on `volleydzen.mp4`:
   --reid auto \
   --ocr auto \
   --ocr-backend paddleocr \
-  --roster data/config/volleydzen_roster.json \
+  --roster "$ROSTER" \
   --ocr-languages en \
   --ocr-min-confidence 0.85 \
   --ocr-relabel-min-confidence 0.92 \
@@ -134,15 +164,15 @@ This is the best current command for player marking on `volleydzen.mp4`:
   --reid-relabel-max-center-jump 100 \
   --ocr-every-n-frames 15 \
   --match-threshold 0 \
-  --output-dir data/processed/volleydzen_labeled
+  --output-dir "data/processed/${STEM}_labeled"
 ```
 
 Outputs:
 
 ```text
-data/processed/volleydzen_labeled/volleydzen_annotated.mp4
-data/processed/volleydzen_labeled/volleydzen_test_tracking.json
-data/processed/volleydzen_labeled/volleydzen_test_tracking.csv
+data/processed/${STEM}_labeled/${STEM}_annotated.mp4
+data/processed/${STEM}_labeled/${STEM}_test_tracking.json
+data/processed/${STEM}_labeled/${STEM}_test_tracking.csv
 ```
 
 ## 6. Label Receive Moments
@@ -150,8 +180,8 @@ data/processed/volleydzen_labeled/volleydzen_test_tracking.csv
 This labels likely receive/contact moments from the vball-net ball trajectory:
 
 ```bash
-./venv/bin/python tools/label_receive_from_ball.py data/game/volleydzen.mp4 \
-  --ball-track data/processed/vball_net_raw/volleydzen.csv \
+./venv/bin/python tools/label_receive_from_ball.py "$VIDEO" \
+  --ball-track "$BALL_TRACK" \
   --output-dir data/processed/receive_from_ball \
   --label-hold-sec 2 \
   --trail-length 45
@@ -160,8 +190,8 @@ This labels likely receive/contact moments from the vball-net ball trajectory:
 Outputs:
 
 ```text
-data/processed/receive_from_ball/volleydzen_receive_from_ball_annotated.mp4
-data/processed/receive_from_ball/volleydzen_receive_from_ball.json
+data/processed/receive_from_ball/${STEM}_receive_from_ball_annotated.mp4
+data/processed/receive_from_ball/${STEM}_receive_from_ball.json
 ```
 
 ## Command Notes
@@ -172,6 +202,7 @@ data/processed/receive_from_ball/volleydzen_receive_from_ball.json
 - `--ocr-min-confidence 0.85` ignores OCR reads below this confidence.
 - `--ocr-relabel-min-confidence 0.92` requires stronger OCR before changing an existing tracked label.
 - `--ocr-skip-overlap-iou 0.25` disables OCR for boxes overlapping another player by at least this IoU.
+- `--ocr-every-n-frames 15` runs OCR every 15 frames to reduce CPU cost. Use `--ocr-every-n-frames 1` to try OCR on every frame, but PaddleOCR is heavy and this will be much slower.
 - `--reid auto` allows OSNet/SoccerNet ReID to help fill missing roster labels.
 - `--reid-relabel-max-center-jump 100` rejects ReID roster-fill labels that would jump too far from the player's predicted smooth position.
 - `--predict-missing-players` keeps labels moving with estimated velocity when detection temporarily misses a player.

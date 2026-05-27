@@ -650,10 +650,13 @@
       }
 
       function renderAll() {
-        renderPlayers();
-        renderSamples();
-        renderQueueMeta();
-        els.save.disabled = !state.allowSave && state.samples.length === 0;
+        try {
+          renderPlayers();
+          renderSamples();
+          renderQueueMeta();
+        } finally {
+          els.save.disabled = !state.allowSave && state.samples.length === 0;
+        }
       }
 
       function renderPlayers() {
@@ -695,10 +698,17 @@
           remove.addEventListener("click", () => removeSample(sample.sample_id));
           const label = document.createElement("div");
           const source = sample.existing ? "saved" : "new";
-          label.textContent = `${sample.player_id} - ${source} - ${sample.source_video} @ ${sample.time_sec.toFixed(2)}s`;
+          const timeSec = sampleTimeSec(sample);
+          label.textContent = `${sample.player_id} - ${source} - ${sample.source_video || "unknown"} @ ${timeSec.toFixed(2)}s`;
           card.append(img, remove, label);
           els.sampleGrid.append(card);
         });
+      }
+
+      function sampleTimeSec(sample) {
+        if (Number.isFinite(Number(sample.time_sec))) return Number(sample.time_sec);
+        if (Number.isFinite(Number(sample.time_ms))) return Number(sample.time_ms) / 1000;
+        return 0;
       }
 
       async function loadExisting(announce = true) {

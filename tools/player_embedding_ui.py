@@ -15,6 +15,8 @@ from urllib.parse import urlparse
 ROOT = Path(__file__).resolve().parents[1]
 TOOLS_DIR = ROOT / "tools"
 OUTPUT_DIR = ROOT / "data" / "processed" / "player_embeddings"
+OUTPUT_PATH = OUTPUT_DIR / "player_embeddings.json"
+SNAPSHOT_DIR = OUTPUT_DIR / "snapshots"
 HTML_FILE = TOOLS_DIR / "player_embedding_ui.html"
 
 
@@ -76,8 +78,8 @@ class PlayerEmbeddingHandler(BaseHTTPRequestHandler):
         samples = payload["samples"]
         players = payload["players"]
 
-        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        snapshot_root = OUTPUT_DIR / "snapshots"
+        OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        snapshot_root = SNAPSHOT_DIR
         snapshot_root.mkdir(parents=True, exist_ok=True)
 
         saved_samples = []
@@ -117,12 +119,12 @@ class PlayerEmbeddingHandler(BaseHTTPRequestHandler):
                 ),
             },
             "saved_files": {
-                "embeddings": str(OUTPUT_DIR / "player_embeddings.json"),
+                "embeddings": str(OUTPUT_PATH),
                 "snapshots": str(snapshot_root),
             },
         }
 
-        embeddings_path = OUTPUT_DIR / "player_embeddings.json"
+        embeddings_path = OUTPUT_PATH
         embeddings_path.write_text(json.dumps(output, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
         return {
@@ -131,7 +133,7 @@ class PlayerEmbeddingHandler(BaseHTTPRequestHandler):
         }
 
     def _load_existing(self) -> dict:
-        embeddings_path = OUTPUT_DIR / "player_embeddings.json"
+        embeddings_path = OUTPUT_PATH
         if not embeddings_path.exists():
             return {"ok": True, "exists": False, "players": [], "samples": []}
 
@@ -172,25 +174,43 @@ def _safe_name(value: str) -> str:
 
 
 def main() -> None:
+    global OUTPUT_PATH, SNAPSHOT_DIR
+
     import argparse
 
     parser = argparse.ArgumentParser(description="Run the player snapshot and embedding UI.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8767)
+    parser.add_argument("--video", default=None, help="Optional reminder path; select this video in the browser UI.")
+    parser.add_argument("--output", default=str(OUTPUT_PATH), help="Path to save player_embeddings.json.")
+    parser.add_argument("--snapshot-dir", default=str(SNAPSHOT_DIR), help="Directory to save player crop snapshots.")
     args = parser.parse_args()
+
+    OUTPUT_PATH = resolve_project_path(args.output)
+    SNAPSHOT_DIR = resolve_project_path(args.snapshot_dir)
 
     if not HTML_FILE.exists():
         raise SystemExit(f"Missing UI file: {HTML_FILE}")
 
     server = ThreadingHTTPServer((args.host, args.port), PlayerEmbeddingHandler)
     print(f"Player embedding UI: http://{args.host}:{args.port}/")
-    print(f"Outputs will be saved in: {OUTPUT_DIR}")
+    if args.video:
+        print(f"Select this video in the browser UI: {resolve_project_path(args.video)}")
+    print(f"Embeddings will be saved to: {OUTPUT_PATH}")
+    print(f"Snapshots will be saved in: {SNAPSHOT_DIR}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nStopping player embedding UI.")
     finally:
         server.server_close()
+
+
+def resolve_project_path(value: str | Path) -> Path:
+    path = Path(value).expanduser()
+    if path.is_absolute():
+        return path
+    return (ROOT / path).resolve()
 
 
 if __name__ == "__main__":
