@@ -168,6 +168,7 @@ def main() -> int:
     parser.add_argument("--yolo-model", default="yolov8n.pt")
     parser.add_argument("--device", default="cpu", help="Ultralytics device, for example cpu, 0, or cuda:0.")
     parser.add_argument("--embedding-device", default="cpu", help="Torchreid device, for example cpu, 0, or cuda:0.")
+    parser.add_argument("--players", choices=["auto", "off"], default="auto", help="Use player detection/tracking. Set off for ball-only debug videos.")
     parser.add_argument("--reid", choices=["auto", "off"], default="auto", help="Use stored player embeddings for ReID fallback labeling.")
     parser.add_argument("--ocr", choices=["auto", "off"], default="auto", help="Prefer jersey-number OCR before ReID matching.")
     parser.add_argument("--ocr-device", choices=["cpu", "cuda"], default="cpu")
@@ -249,6 +250,25 @@ def main() -> int:
     )
     parser.add_argument("--trail-length", type=int, default=45, help="Number of recent ball points to draw.")
     parser.add_argument("--max-ball-gap", type=int, default=18, help="Predict ball position through this many hidden frames.")
+    parser.add_argument("--ball-max-jump", type=float, default=95.0, help="Reject ball detections farther than this many pixels from the predicted ball position in one frame.")
+    parser.add_argument(
+        "--ball-reacquire-gap",
+        type=int,
+        default=5,
+        help="After this many consecutive missing ball frames, use --ball-reacquire-max-jump for the next accepted real detection.",
+    )
+    parser.add_argument(
+        "--ball-reacquire-max-jump",
+        type=float,
+        default=1000.0,
+        help="Temporary ball jump limit used after --ball-reacquire-gap missing frames.",
+    )
+    parser.add_argument(
+        "--ball-source",
+        choices=["auto", "vball-net", "yolo", "motion"],
+        default="auto",
+        help="Which ball detections to use before optional prediction.",
+    )
     parser.add_argument(
         "--team-filter",
         choices=["auto", "polygon", "court-intersection", "court-nearest-6", "largest", "lower-half", "none"],
@@ -271,18 +291,26 @@ def main() -> int:
 
     layout_data = load_layout_data(Path(args.layout))
     layout = extract_layout_polygon(layout_data)
-    player_refs, embedding_info = load_player_embeddings(Path(args.embeddings))
-    roster = load_roster(args.roster, args.roster_name_threshold, args.roster_name_margin)
-    if roster is not None:
-        player_refs = merge_roster_refs(player_refs, roster)
-        print(f"Loaded roster players: {len(roster.players)}")
-    configure_embedding_backend(deps, embedding_info, args.embedding_device, enabled=args.reid != "off")
-    configure_ocr_backend(deps, args, embedding_info, player_refs)
+    players_enabled = args.players != "off"
+    player_refs: list[dict[str, Any]] = []
+    embedding_info: dict[str, Any] = {}
+    roster = None
+    if players_enabled:
+        player_refs, embedding_info = load_player_embeddings(Path(args.embeddings))
+        roster = load_roster(args.roster, args.roster_name_threshold, args.roster_name_margin)
+        if roster is not None:
+            player_refs = merge_roster_refs(player_refs, roster)
+            print(f"Loaded roster players: {len(roster.players)}")
+        configure_embedding_backend(deps, embedding_info, args.embedding_device, enabled=args.reid != "off")
+        configure_ocr_backend(deps, args, embedding_info, player_refs)
+    else:
+        deps["reid_embedder"] = None
+        print("Player detection disabled; producing ball-only output.")
     external_ball_track = load_or_create_ball_track(args, video_path)
     model = deps["YOLO"](args.yolo_model)
-    player_tracker = create_player_tracker(args)
+    player_tracker = create_player_tracker(args) if players_enabled else None
     uniform_samples = []
-    if args.uniform_color_filter and args.uniform_color_source == "embeddings":
+    if players_enabled and args.uniform_color_filter and args.uniform_color_source == "embeddings":
         uniform_samples = load_uniform_color_samples(Path(args.embeddings), deps, args.uniform_color_max_samples)
     uniform_filter = UniformColorFilter(
         enabled=args.uniform_color_filter,
@@ -334,9 +362,12 @@ def main() -> int:
         ]
 
         yolo_ball_candidates: list[BallObservation] = []
-        should_detect_players = args.tracker == "bytetrack" or frame_idx % max(1, args.frame_stride) == 0
+        should_detect_model = (
+            (players_enabled and (args.tracker == "bytetrack" or frame_idx % max(1, args.frame_stride) == 0))
+            or args.ball_source in ("auto", "yolo")
+        )
         detections: list[PlayerDetection] = []
-        if should_detect_players:
+        if should_detect_model:
             result = model.predict(frame, verbose=False, conf=0.20, device=args.device)[0]
             person_candidates = []
             for box in result.boxes:
@@ -351,28 +382,32 @@ def main() -> int:
                     radius = max(3.0, (x2 - x1 + y2 - y1) / 4)
                     yolo_ball_candidates.append(BallObservation(frame_idx, cx, cy, radius, conf, "yolo_sports_ball"))
 
-            person_candidates = suppress_duplicate_person_boxes(person_candidates, args.person_nms_iou)
-            team_candidates = filter_team_candidates(
-                person_candidates,
-                layout,
-                width,
-                height,
-                mode=args.team_filter,
-            )
-            team_candidates = uniform_filter.filter_candidates(deps, frame, team_candidates)
-            detections = build_player_detections(
-                deps=deps,
-                frame=frame,
-                frame_idx=frame_idx,
-                candidates=team_candidates,
-                player_refs=player_refs,
-                threshold=args.match_threshold,
-                ocr_enabled=should_run_ocr(args, frame_idx),
-                ocr_overlap_iou=args.ocr_skip_overlap_iou,
-                roster=roster,
-                use_reid=args.reid != "off",
-            )
-        if args.tracker == "bytetrack":
+            if not players_enabled:
+                person_candidates = []
+                team_candidates = []
+            else:
+                person_candidates = suppress_duplicate_person_boxes(person_candidates, args.person_nms_iou)
+                team_candidates = filter_team_candidates(
+                    person_candidates,
+                    layout,
+                    width,
+                    height,
+                    mode=args.team_filter,
+                )
+                team_candidates = uniform_filter.filter_candidates(deps, frame, team_candidates)
+                detections = build_player_detections(
+                    deps=deps,
+                    frame=frame,
+                    frame_idx=frame_idx,
+                    candidates=team_candidates,
+                    player_refs=player_refs,
+                    threshold=args.match_threshold,
+                    ocr_enabled=should_run_ocr(args, frame_idx),
+                    ocr_overlap_iou=args.ocr_skip_overlap_iou,
+                    roster=roster,
+                    use_reid=args.reid != "off",
+                )
+        if players_enabled and args.tracker == "bytetrack":
             update_bytetrack_player_tracks(
                 player_tracker,
                 player_tracks,
@@ -387,7 +422,7 @@ def main() -> int:
             fill_current_roster_labels(player_tracks, frame_idx, roster, player_refs, args.fill_roster_labels, use_reid=args.reid != "off", reid_max_center_jump=args.reid_relabel_max_center_jump)
             last_player_detections = current_tracker_detections(player_tracks, frame_idx)
             player_boxes_for_ball = [det.bbox for det in last_player_detections]
-        elif args.tracker == "deepsort":
+        elif players_enabled and args.tracker == "deepsort":
             update_deepsort_player_tracks(
                 player_tracker,
                 player_tracks,
@@ -401,7 +436,7 @@ def main() -> int:
             fill_current_roster_labels(player_tracks, frame_idx, roster, player_refs, args.fill_roster_labels, use_reid=args.reid != "off", reid_max_center_jump=args.reid_relabel_max_center_jump)
             last_player_detections = current_tracker_detections(player_tracks, frame_idx)
             player_boxes_for_ball = [det.bbox for det in last_player_detections]
-        elif should_detect_players:
+        elif players_enabled and should_detect_model:
             next_track_id = update_player_tracks(
                 player_tracks,
                 detections,
@@ -417,25 +452,32 @@ def main() -> int:
             player_boxes_for_ball = [det.bbox for det in last_player_detections]
 
         external_ball = external_ball_track.get(frame_idx)
-        if external_ball is not None:
-            ball_state.update(external_ball)
-            ball = external_ball
-        else:
-            motion_candidates = detect_motion_ball_candidates(
-                deps=deps,
-                frame=frame,
-                bg=bg,
-                near_polygon=layout,
-                player_boxes=player_boxes_for_ball,
-                frame_idx=frame_idx,
-                predicted_ball=ball_state.predict(frame_idx),
+        ball_candidates: list[BallObservation] = []
+        if args.ball_source in ("auto", "yolo"):
+            ball_candidates.extend(yolo_ball_candidates)
+        if args.ball_source in ("auto", "motion"):
+            ball_candidates.extend(
+                detect_motion_ball_candidates(
+                    deps=deps,
+                    frame=frame,
+                    bg=bg,
+                    near_polygon=layout,
+                    player_boxes=player_boxes_for_ball,
+                    frame_idx=frame_idx,
+                    predicted_ball=ball_state.predict(frame_idx),
+                )
             )
-            ball = update_ball_state(
-                candidates=[*yolo_ball_candidates, *motion_candidates],
-                state=ball_state,
-                frame_idx=frame_idx,
-                max_gap=args.max_ball_gap,
-            )
+        if args.ball_source in ("auto", "vball-net") and external_ball is not None:
+            ball_candidates.insert(0, external_ball)
+        ball = update_ball_state(
+            candidates=ball_candidates,
+            state=ball_state,
+            frame_idx=frame_idx,
+            max_gap=args.max_ball_gap,
+            max_jump=args.ball_max_jump,
+            reacquire_gap=args.ball_reacquire_gap,
+            reacquire_max_jump=args.ball_reacquire_max_jump,
+        )
         if ball:
             ball_track.append(ball)
 
@@ -1772,9 +1814,20 @@ def update_ball_state(
     state: BallState,
     frame_idx: int,
     max_gap: int,
+    max_jump: float,
+    reacquire_gap: int,
+    reacquire_max_jump: float,
 ) -> BallObservation | None:
     predicted = state.predict(frame_idx)
-    accepted = choose_ball_candidate(candidates, predicted, has_track=state.last is not None)
+    effective_max_jump = max_jump
+    if state.missed >= max(1, reacquire_gap):
+        effective_max_jump = reacquire_max_jump
+    accepted = choose_ball_candidate(
+        candidates,
+        predicted,
+        has_track=state.last is not None,
+        max_jump=effective_max_jump,
+    )
     if accepted is not None:
         state.update(accepted)
         return accepted
@@ -1790,6 +1843,7 @@ def choose_ball_candidate(
     candidates: list[BallObservation],
     predicted: BallObservation | None,
     has_track: bool,
+    max_jump: float,
 ) -> BallObservation | None:
     if not candidates:
         return None
@@ -1799,9 +1853,12 @@ def choose_ball_candidate(
 
     def score(candidate: BallObservation) -> float:
         distance = math.hypot(candidate.x - predicted.x, candidate.y - predicted.y)
-        expected_limit = 130 + 22 * max(1, candidate.frame - predicted.frame)
+        dt = max(1, candidate.frame - predicted.frame)
+        expected_limit = max_jump * dt
+        if distance > expected_limit:
+            return -float("inf")
         distance_penalty = min(1.0, distance / expected_limit)
-        source_bonus = 0.12 if candidate.source == "yolo_sports_ball" else 0.0
+        source_bonus = 0.18 if candidate.source == "vball-net" else 0.12 if candidate.source == "yolo_sports_ball" else 0.0
         return candidate.confidence + source_bonus - 0.65 * distance_penalty
 
     best = max(candidates, key=score)

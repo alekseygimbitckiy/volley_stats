@@ -10,7 +10,8 @@ STEM=volleydzen
 ROSTER=data/config/volleydzen_roster.json
 EMBEDDINGS=data/processed/volleydzen_jersey_embeddings/player_embeddings.json
 SNAPSHOTS=data/processed/volleydzen_jersey_embeddings/snapshots
-BALL_TRACK=data/processed/vball_net_raw/volleydzen.csv
+FAST_BALL_TRACK=data/processed/fast_vball_raw/volleydzen.csv
+BALL_TRACK="$FAST_BALL_TRACK"
 ```
 
 ## 1. Mark Court
@@ -125,19 +126,52 @@ After manual changes, rebuild OSNet embeddings before running video labeling:
 
 ## 4. Run Ball Tracking
 
-Run vball-net and save the ball track:
+Run the fast volleyball tracker and save the normalized ball track:
 
 ```bash
-./venv/bin/python tools/run_vball_net.py "$VIDEO" \
-  --model-path external/vball-net/vb-models/VballNetFastV1_155_h288_w512.onnx \
-  --output-dir data/processed/vball_net_raw
+./venv/bin/python tools/run_fast_vball.py "$VIDEO" \
+  --backend onnx \
+  --model-path external/fast-volleyball-tracking-inference/models/VballNetV1_seq9_grayscale_148_h288_w512.onnx \
+  --track-length 32 \
+  --output-dir data/processed/fast_vball_raw
 ```
 
 Outputs:
 
 ```text
-$BALL_TRACK
-data/processed/vball_net_raw/$STEM.json
+$FAST_BALL_TRACK
+data/processed/fast_vball_raw/$STEM.json
+data/processed/fast_vball_raw/$STEM/ball.csv
+```
+
+Set the active ball track for the rest of the pipeline:
+
+```bash
+BALL_TRACK="$FAST_BALL_TRACK"
+```
+
+To create a ball-only debug video without player labels:
+
+```bash
+./venv/bin/python tools/test_track_video.py "$VIDEO" \
+  --players off \
+  --ball-track "$BALL_TRACK" \
+  --ball-source vball-net \
+  --max-ball-gap 0 \
+  --ball-max-jump 100 \
+  --ball-reacquire-gap 5 \
+  --ball-reacquire-max-jump 1000 \
+  --team-filter none \
+  --tracker iou \
+  --ocr off \
+  --reid off \
+  --output-dir "data/processed/${STEM}_ball_only"
+```
+
+Output:
+
+```text
+data/processed/${STEM}_ball_only/${STEM}_annotated.mp4
 ```
 
 ## 5. Label Video
@@ -207,3 +241,6 @@ data/processed/receive_from_ball/${STEM}_receive_from_ball.json
 - `--reid-relabel-max-center-jump 100` rejects ReID roster-fill labels that would jump too far from the player's predicted smooth position.
 - `--predict-missing-players` keeps labels moving with estimated velocity when detection temporarily misses a player.
 - Avoid `--uniform-color-filter` for the current setup; it was less stable than court filtering plus OCR/ReID/tracking.
+- `--ball-max-jump 100` rejects a detected ball if it is more than 100 pixels from the predicted next ball position during normal continuous tracking. This removes single-frame noisy jumps.
+- `--ball-reacquire-gap 5` starts relaxed reacquisition after 5 consecutive frames without an accepted real ball detection.
+- `--ball-reacquire-max-jump 1000` allows the first real detection after that gap to be up to 1000 pixels from the old prediction. After that detection is accepted, the normal `--ball-max-jump 100` limit is used again.
