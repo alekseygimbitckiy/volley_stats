@@ -264,6 +264,12 @@ def main() -> int:
         help="Temporary ball jump limit used after --ball-reacquire-gap missing frames.",
     )
     parser.add_argument(
+        "--ball-reset-gap",
+        type=int,
+        default=45,
+        help="After this many consecutive rejected/missing ball frames, reset ball state so tracking can restart anywhere.",
+    )
+    parser.add_argument(
         "--ball-source",
         choices=["auto", "vball-net", "yolo", "motion"],
         default="auto",
@@ -340,6 +346,7 @@ def main() -> int:
     bg = cv2.createBackgroundSubtractorMOG2(history=120, varThreshold=18, detectShadows=False)
     player_tracks: list[PlayerTrack] = []
     ball_track: list[BallObservation] = []
+    visible_player_detections: list[dict[str, Any]] = []
     last_player_detections: list[PlayerDetection] = []
     ball_state = BallState()
     next_track_id = 1
@@ -477,9 +484,15 @@ def main() -> int:
             max_jump=args.ball_max_jump,
             reacquire_gap=args.ball_reacquire_gap,
             reacquire_max_jump=args.ball_reacquire_max_jump,
+            reset_gap=args.ball_reset_gap,
         )
         if ball:
             ball_track.append(ball)
+
+        if players_enabled:
+            visible_player_detections.append(
+                serialize_visible_player_detections(player_tracks, frame_idx, max_gap=12)
+            )
 
         if writer:
             annotated = draw_debug_frame(
@@ -509,6 +522,7 @@ def main() -> int:
         "team_filter": args.team_filter,
         "ball_track": [ball.__dict__ for ball in ball_track],
         "player_tracks": serialize_tracks(player_tracks),
+        "visible_player_detections": visible_player_detections,
     }
     json_path = output_dir / f"{output_stem}_test_tracking.json"
     csv_path = output_dir / f"{output_stem}_test_tracking.csv"
@@ -575,7 +589,7 @@ def load_or_create_ball_track(
 def load_ball_track_file(path: Path) -> dict[int, BallObservation]:
     if path.suffix == ".json":
         data = json.loads(path.read_text(encoding="utf-8"))
-        rows = data.get("ball_positions", data if isinstance(data, list) else [])
+        rows = data.get("ball_track", data.get("ball_positions", data if isinstance(data, list) else []))
     else:
         with path.open("r", encoding="utf-8", newline="") as handle:
             rows = list(csv.DictReader(handle))
@@ -588,11 +602,14 @@ def load_ball_track_file(path: Path) -> dict[int, BallObservation]:
         y = row.get("y", row.get("Y"))
         if x in (None, "", "-1") or y in (None, "", "-1"):
             continue
+        radius = row.get("radius")
+        if radius in (None, ""):
+            radius = max(5.0, float(row.get("width", row.get("W", 10)) or 10) / 2)
         track[frame] = BallObservation(
             frame=frame,
             x=float(x),
             y=float(y),
-            radius=max(5.0, float(row.get("width", row.get("W", 10)) or 10) / 2),
+            radius=float(radius),
             confidence=confidence,
             source=str(row.get("source", "external_ball_track") or "external_ball_track"),
         )
@@ -945,9 +962,19 @@ def nearest_court_candidates(
     if len(polygon) < 2:
         return largest_candidates(court_hits or candidates, limit=limit)
     front_a, front_b = polygon[0], polygon[1]
+    court_min_y = min(point[1] for point in polygon)
+
+    def candidate_tier(candidate: tuple[float, float, float, float, float]) -> int:
+        if candidate in court_hits:
+            return 0
+        if candidate_foot(candidate)[1] >= court_min_y:
+            return 1
+        return 2
+
     ranked = sorted(
-        court_hits,
+        candidates,
         key=lambda candidate: (
+            candidate_tier(candidate),
             distance_point_to_segment(candidate_foot(candidate), front_a, front_b),
             -candidate[4],
         ),
@@ -1817,7 +1844,15 @@ def update_ball_state(
     max_jump: float,
     reacquire_gap: int,
     reacquire_max_jump: float,
+    reset_gap: int,
 ) -> BallObservation | None:
+    if state.missed >= max(1, reset_gap):
+        state.last = None
+        state.prev = None
+        state.vx = 0.0
+        state.vy = 0.0
+        state.missed = 0
+
     predicted = state.predict(frame_idx)
     effective_max_jump = max_jump
     if state.missed >= max(1, reacquire_gap):
@@ -2126,6 +2161,58 @@ def serialize_tracks(tracks: list[PlayerTrack]) -> list[dict[str, Any]]:
         }
         for track in tracks
     ]
+
+
+def serialize_visible_player_detections(
+    tracks: list[PlayerTrack],
+    frame: int,
+    max_gap: int,
+) -> dict[str, Any]:
+    visible = []
+    visible_detections = []
+    for track in tracks:
+        det = latest_detection_near_frame(track, frame, max_gap=max_gap)
+        if det is None:
+            continue
+        visible_detections.append((track, det))
+
+    unique_player_detection_ids = nearest_visible_detection_ids_by_player(visible_detections)
+    for track, det in visible_detections:
+        use_player_label = det.player_id is not None and id(det) in unique_player_detection_ids
+        display_label = det.player_id if use_player_label else f"track_{track.track_id}"
+        if use_player_label and det.identity_source == "ocr_name":
+            display_label = f"{display_label} {det.shirt_name}"
+        elif use_player_label and det.identity_source == "ocr_number":
+            display_label = f"{display_label} #{det.jersey_number}"
+        if use_player_label:
+            ocr_confidence = display_ocr_confidence(det)
+            if ocr_confidence is not None:
+                display_label = f"{display_label} ocr={ocr_confidence:.2f}"
+
+        visible.append(
+            {
+                "track_id": track.track_id,
+                "source_frame": det.frame,
+                "display_label": display_label,
+                "uses_player_label": use_player_label,
+                "bbox": {
+                    "x1": det.bbox[0],
+                    "y1": det.bbox[1],
+                    "x2": det.bbox[2],
+                    "y2": det.bbox[3],
+                },
+                "confidence": det.confidence,
+                "player_id": det.player_id if use_player_label else None,
+                "raw_player_id": det.player_id,
+                "player_distance": det.player_distance,
+                "jersey_number": det.jersey_number,
+                "jersey_confidence": det.jersey_confidence,
+                "shirt_name": det.shirt_name,
+                "shirt_name_confidence": det.shirt_name_confidence,
+                "identity_source": det.identity_source,
+            }
+        )
+    return {"frame": frame, "detections": visible}
 
 
 def write_csv(
