@@ -5,11 +5,12 @@ This document shows the current command sequence for processing one rally video.
 The pipeline is:
 
 1. Mark the near-side court.
-2. Prepare roster and player embeddings.
-3. Run fast volleyball ball tracking.
-4. Clean the ball track.
-5. Label the six nearest-team players.
-6. Classify serve, receive, and technical actions with the pose SVM.
+2. Mark reception scoring zones.
+3. Prepare roster and player embeddings.
+4. Run fast volleyball ball tracking.
+5. Clean the ball track.
+6. Label the six nearest-team players.
+7. Classify serve, receive, and technical actions with the pose SVM.
 
 ## 0. Set Variables
 
@@ -61,7 +62,35 @@ If port `8765` is busy:
 ./venv/bin/python tools/field_marking_ui.py --host 127.0.0.1 --port 8766
 ```
 
-## 2. Prepare Roster
+## 2. Mark Reception Scoring Zones
+
+Run the reception zone marking UI:
+
+```bash
+./venv/bin/python tools/reception_zone_marking_ui.py --host 127.0.0.1 --port 8768
+```
+
+Open:
+
+```text
+http://127.0.0.1:8768/
+```
+
+Draw the zones where the pass should originate after reception:
+
+- score `1`: perfect reception zone
+- score `0.5`: acceptable reception zone
+
+The UI writes:
+
+```text
+data/processed/calibrations/reception_zones.json
+data/processed/calibrations/reception_zones_annotated.png
+```
+
+The final classifier draws these zones on the annotated video and uses the passer's bottom-center court point for scoring.
+
+## 3. Prepare Roster
 
 Create or edit the roster file:
 
@@ -82,7 +111,7 @@ Example format:
 
 Use Cyrillic or Latin names if they are visible on shirts. OCR matching accepts similar names, but the jersey number must match the roster entry when both name and number are used.
 
-## 3. Bootstrap Jersey Snapshots And Embeddings
+## 4. Bootstrap Jersey Snapshots And Embeddings
 
 This samples frames, detects near-side players, reads jersey numbers or names with OCR, saves confident crops, and builds OSNet/SoccerNet ReID embeddings.
 
@@ -111,7 +140,7 @@ $EMBEDDINGS
 $SNAPSHOTS/
 ```
 
-## 4. Optional Manual Player Snapshot Fixes
+## 5. Optional Manual Player Snapshot Fixes
 
 If automatic bootstrapping misses a player or saves weak crops, add or remove snapshots manually:
 
@@ -137,7 +166,7 @@ After manual changes, rebuild embeddings:
   --device cpu
 ```
 
-## 5. Run Fast Ball Tracking
+## 6. Run Fast Ball Tracking
 
 Run fast volleyball ball tracking:
 
@@ -152,7 +181,7 @@ Expected output:
 $FAST_BALL_TRACK
 ```
 
-## 6. Clean Ball Track
+## 7. Clean Ball Track
 
 Create a cleaned ball-only debug video and cleaned JSON. This applies jump filtering and resets the ball state after missing or rejected detections.
 
@@ -181,7 +210,7 @@ $CLEAN_OUT_DIR/${STEM}_test_tracking.csv
 
 Use `$CLEAN_BALL_TRACK` for the rest of the pipeline, not the raw `$BALL_TRACK`.
 
-## 7. Label Nearest-Team Players
+## 8. Label Nearest-Team Players
 
 This labels the six near-side players using YOLO, ByteTrack, PaddleOCR, roster filling, missing-player prediction, and OSNet/SoccerNet ReID fallback.
 
@@ -226,7 +255,7 @@ $OUT_DIR/${STEM}_test_tracking.csv
 
 The default command uses `--ocr-languages en,ru` so PaddleOCR can read both Latin and Cyrillic shirt text.
 
-## 8. Classify Serve, Receive, And Actions
+## 9. Classify Serve, Receive, And Actions
 
 This creates the final annotated rally video. It uses the cleaned ball track, the labeled player JSON, and the pose SVM classifier.
 
@@ -234,11 +263,13 @@ This creates the final annotated rally video. It uses the cleaned ball track, th
 ./venv/bin/python tools/classify_rally_serve_receive.py "$VIDEO" \
   --ball-track "$CLEAN_BALL_TRACK" \
   --tracking-json "$TRACKING_JSON" \
+  --reception-zones data/processed/calibrations/reception_zones.json \
   --team-filter none \
   --output-dir data/processed/rally_classification \
   --pose-svm-model "$POSE_SVM" \
   --pose-model "$POSE_MODEL" \
   --pose-min-detection-confidence 0.20 \
+  --receive-prob-threshold 0.33 \
   --receive-wait-prob-threshold 0.33 \
   --max-ball-gap 0 \
   --ball-max-jump 100 \
@@ -255,6 +286,7 @@ Outputs:
 ```text
 data/processed/rally_classification/${STEM}_serve_receive_annotated.mp4
 data/processed/rally_classification/${STEM}_serve_receive.json
+data/processed/rally_classification/${STEM}_reception_evaluation.json
 ```
 
 Use `--team-filter none` here because player filtering was already done in the player-labeling step.
@@ -276,3 +308,5 @@ Use `--team-filter none` here because player filtering was already done in the p
 - `--reid-relabel-max-center-jump 100` prevents ReID from moving a label too far from its smooth predicted position.
 - Avoid `--uniform-color-filter` for the current setup; it was less stable than court filtering plus OCR/ReID/tracking.
 - The final classifier marks action points at the ball direction-change point. If the ball is hidden during the change, it uses the midpoint between the last visible incoming frame and first visible outgoing frame for player-distance assignment.
+- `--receive-prob-threshold 0.33` marks the first action with `receive_top` or `receive_bottom` probability above `0.33` as the reception.
+- Reception score is saved to `${STEM}_reception_evaluation.json` and printed on the final video. A detected pass inside a score `1` zone gives `1`, inside a score `0.5` zone gives `0.5`, outside zones gives `0`, and missing pass gives `-1`.

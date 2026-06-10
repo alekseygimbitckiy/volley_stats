@@ -1,0 +1,506 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Reception Scoring Zones</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --bg: #f6f6f2;
+        --panel: #ffffff;
+        --text: #202124;
+        --muted: #626a73;
+        --line: #d7dadd;
+        --green: #16834f;
+        --amber: #b7791f;
+        --blue: #2563b8;
+        --danger: #b33232;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+        font-family:
+          Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+          sans-serif;
+      }
+
+      header {
+        border-bottom: 1px solid var(--line);
+        background: var(--panel);
+        padding: 14px 20px;
+      }
+
+      h1 {
+        margin: 0;
+        font-size: 18px;
+        line-height: 1.3;
+      }
+
+      main {
+        display: grid;
+        grid-template-columns: minmax(280px, 360px) minmax(0, 1fr);
+        gap: 16px;
+        padding: 16px;
+      }
+
+      aside,
+      .stage {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+      }
+
+      aside {
+        padding: 14px;
+      }
+
+      .stage {
+        min-height: calc(100vh - 92px);
+        padding: 12px;
+        overflow: auto;
+      }
+
+      section + section {
+        border-top: 1px solid var(--line);
+        margin-top: 14px;
+        padding-top: 14px;
+      }
+
+      h2 {
+        margin: 0 0 8px;
+        font-size: 13px;
+      }
+
+      p,
+      .status,
+      .zone-row {
+        color: var(--muted);
+        font-size: 13px;
+        line-height: 1.45;
+      }
+
+      label {
+        display: block;
+        margin: 10px 0 6px;
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      select,
+      input[type="text"] {
+        width: 100%;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: #fff;
+        color: var(--text);
+        font: inherit;
+        font-size: 13px;
+        padding: 8px;
+      }
+
+      .toolbar {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-top: 10px;
+      }
+
+      button {
+        min-height: 34px;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: #fff;
+        color: var(--text);
+        cursor: pointer;
+        font: inherit;
+        font-size: 13px;
+        padding: 7px 10px;
+      }
+
+      button.primary {
+        border-color: var(--green);
+        background: var(--green);
+        color: #fff;
+      }
+
+      button:disabled {
+        cursor: not-allowed;
+        opacity: 0.45;
+      }
+
+      .canvas-wrap {
+        width: 100%;
+        overflow: auto;
+        border-radius: 6px;
+        background: #222;
+      }
+
+      canvas {
+        display: block;
+        max-width: 100%;
+        height: auto;
+        cursor: crosshair;
+      }
+
+      code {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 12px;
+      }
+
+      .zone-list {
+        display: grid;
+        gap: 6px;
+        margin-top: 8px;
+      }
+
+      .zone-row {
+        display: grid;
+        grid-template-columns: 54px minmax(0, 1fr);
+        gap: 8px;
+        align-items: center;
+      }
+
+      .badge {
+        display: inline-grid;
+        place-items: center;
+        min-width: 44px;
+        height: 24px;
+        border-radius: 999px;
+        color: #fff;
+        font-weight: 700;
+      }
+
+      .score-1 {
+        background: var(--green);
+      }
+
+      .score-half {
+        background: var(--amber);
+      }
+
+      .status {
+        min-height: 20px;
+        margin-top: 10px;
+        white-space: pre-wrap;
+      }
+
+      .status.error {
+        color: var(--danger);
+      }
+
+      @media (max-width: 900px) {
+        main {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Reception Scoring Zones</h1>
+    </header>
+
+    <main>
+      <aside>
+        <section>
+          <h2>Zone Drawing</h2>
+          <p>Draw polygons where the setter/pass action originates. Score 1 is perfect reception. Score 0.5 is acceptable reception.</p>
+          <label for="score">Current zone score</label>
+          <select id="score">
+            <option value="1">1.0 perfect</option>
+            <option value="0.5">0.5 acceptable</option>
+          </select>
+          <div class="toolbar">
+            <button id="finish" class="primary" disabled>Finish Zone</button>
+            <button id="undo" disabled>Undo Point</button>
+            <button id="clearDraft" disabled>Clear Draft</button>
+          </div>
+        </section>
+
+        <section>
+          <h2>Saved Zones</h2>
+          <div id="zoneList" class="zone-list"></div>
+          <div class="toolbar">
+            <button id="deleteLast" disabled>Delete Last Zone</button>
+            <button id="clearZones" disabled>Clear Zones</button>
+          </div>
+        </section>
+
+        <section>
+          <h2>Save</h2>
+          <label for="cameraSetupId">Camera setup ID</label>
+          <input id="cameraSetupId" type="text" value="main_static_endline" />
+          <div class="toolbar">
+            <button id="save" class="primary" disabled>Save Zones</button>
+          </div>
+          <div id="status" class="status"></div>
+        </section>
+      </aside>
+
+      <div class="stage">
+        <div class="canvas-wrap">
+          <canvas id="canvas"></canvas>
+        </div>
+      </div>
+    </main>
+
+    <script>
+      const state = {
+        image: new Image(),
+        frameLoaded: false,
+        layout: null,
+        zones: [],
+        draft: [],
+      };
+
+      const els = {
+        canvas: document.querySelector("#canvas"),
+        score: document.querySelector("#score"),
+        finish: document.querySelector("#finish"),
+        undo: document.querySelector("#undo"),
+        clearDraft: document.querySelector("#clearDraft"),
+        deleteLast: document.querySelector("#deleteLast"),
+        clearZones: document.querySelector("#clearZones"),
+        save: document.querySelector("#save"),
+        status: document.querySelector("#status"),
+        zoneList: document.querySelector("#zoneList"),
+        cameraSetupId: document.querySelector("#cameraSetupId"),
+      };
+
+      const ctx = els.canvas.getContext("2d");
+
+      init();
+
+      async function init() {
+        try {
+          const [layout, zones] = await Promise.all([
+            fetchJson("/layout"),
+            fetchJson("/zones"),
+          ]);
+          state.layout = layout;
+          state.zones = Array.isArray(zones.zones) ? zones.zones : [];
+          state.image.onload = () => {
+            els.canvas.width = state.image.naturalWidth;
+            els.canvas.height = state.image.naturalHeight;
+            state.frameLoaded = true;
+            redraw();
+          };
+          state.image.src = `/frame?cache=${Date.now()}`;
+        } catch (error) {
+          setStatus(String(error), true);
+        }
+      }
+
+      els.canvas.addEventListener("click", (event) => {
+        if (!state.frameLoaded) return;
+        const rect = els.canvas.getBoundingClientRect();
+        const scaleX = els.canvas.width / rect.width;
+        const scaleY = els.canvas.height / rect.height;
+        state.draft.push({
+          x: Math.round((event.clientX - rect.left) * scaleX),
+          y: Math.round((event.clientY - rect.top) * scaleY),
+        });
+        redraw();
+      });
+
+      els.finish.addEventListener("click", () => {
+        if (state.draft.length < 3) return;
+        const score = Number(els.score.value);
+        state.zones.push({
+          zone_id: `score_${String(score).replace(".", "_")}_${state.zones.length + 1}`,
+          label: score === 1 ? "perfect reception zone" : "acceptable reception zone",
+          score,
+          polygon_px: state.draft.map((point, index) => ({ order: index + 1, x: point.x, y: point.y })),
+        });
+        state.draft = [];
+        redraw();
+      });
+
+      els.undo.addEventListener("click", () => {
+        state.draft.pop();
+        redraw();
+      });
+      els.clearDraft.addEventListener("click", () => {
+        state.draft = [];
+        redraw();
+      });
+      els.deleteLast.addEventListener("click", () => {
+        state.zones.pop();
+        redraw();
+      });
+      els.clearZones.addEventListener("click", () => {
+        state.zones = [];
+        redraw();
+      });
+      els.save.addEventListener("click", saveZones);
+
+      async function saveZones() {
+        if (!state.zones.length) return;
+        const metadata = {
+          schema_version: 1,
+          camera_setup_id: els.cameraSetupId.value.trim() || "main_static_endline",
+          frame: {
+            width_px: els.canvas.width,
+            height_px: els.canvas.height,
+          },
+          source_files: {
+            field_layout: "data/processed/calibrations/field_layout.json",
+            source_frame: "data/processed/calibrations/field_layout_source_frame.png",
+          },
+          zones: state.zones,
+          usage: {
+            anchor: "Use the passer player foot/bottom-center point to score the receiver.",
+            score_1: "Passer position inside a score 1 zone gives reception score 1.",
+            score_0_5: "Passer position inside a score 0.5 zone gives reception score 0.5.",
+            score_0: "Pass occurred outside marked zones gives reception score 0.",
+            score_minus_1: "No pass action after reception gives reception score -1.",
+          },
+          created_at: new Date().toISOString(),
+        };
+        const response = await fetch("/save", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            metadata,
+            annotated_png: els.canvas.toDataURL("image/png"),
+          }),
+        });
+        const result = await response.json();
+        if (!response.ok || !result.ok) {
+          setStatus(result.error || "Save failed.", true);
+          return;
+        }
+        setStatus(`Saved:\n${result.files.zones}\n${result.files.annotated_frame}`);
+      }
+
+      function redraw() {
+        if (!state.frameLoaded) return;
+        ctx.clearRect(0, 0, els.canvas.width, els.canvas.height);
+        ctx.drawImage(state.image, 0, 0);
+        drawCourt();
+        for (const zone of state.zones) drawZone(zone, false);
+        drawDraft();
+        renderZoneList();
+        updateButtons();
+      }
+
+      function drawCourt() {
+        const points = state.layout?.near_side_boundary_px || [];
+        if (points.length < 3) return;
+        ctx.save();
+        ctx.beginPath();
+        ctx.moveTo(points[0].x, points[0].y);
+        for (const point of points.slice(1)) ctx.lineTo(point.x, point.y);
+        ctx.closePath();
+        ctx.fillStyle = "rgba(37, 99, 184, 0.08)";
+        ctx.fill();
+        ctx.strokeStyle = "rgba(37, 99, 184, 0.95)";
+        ctx.lineWidth = 3;
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      function drawZone(zone, draft) {
+        const points = zone.polygon_px || zone.points || [];
+        if (!points.length) return;
+        const color = Number(zone.score) === 1 ? "#16834f" : "#b7791f";
+        ctx.save();
+        ctx.beginPath();
+        ctx.moveTo(points[0].x, points[0].y);
+        for (const point of points.slice(1)) ctx.lineTo(point.x, point.y);
+        if (!draft && points.length >= 3) ctx.closePath();
+        if (points.length >= 3) {
+          ctx.fillStyle = Number(zone.score) === 1 ? "rgba(22, 131, 79, 0.24)" : "rgba(183, 121, 31, 0.24)";
+          ctx.fill();
+        }
+        ctx.strokeStyle = color;
+        ctx.lineWidth = draft ? 3 : 4;
+        ctx.stroke();
+        ctx.font = "20px sans-serif";
+        ctx.fillStyle = "#fff";
+        ctx.strokeStyle = "rgba(0,0,0,0.7)";
+        ctx.lineWidth = 4;
+        const label = `score ${zone.score}`;
+        ctx.strokeText(label, points[0].x + 8, points[0].y - 8);
+        ctx.fillText(label, points[0].x + 8, points[0].y - 8);
+        ctx.restore();
+      }
+
+      function drawDraft() {
+        const score = Number(els.score.value);
+        const zone = { score, polygon_px: state.draft };
+        drawZone(zone, true);
+        ctx.save();
+        for (const [index, point] of state.draft.entries()) {
+          ctx.beginPath();
+          ctx.arc(point.x, point.y, 8, 0, Math.PI * 2);
+          ctx.fillStyle = score === 1 ? "#16834f" : "#b7791f";
+          ctx.fill();
+          ctx.strokeStyle = "#fff";
+          ctx.lineWidth = 2;
+          ctx.stroke();
+          ctx.fillStyle = "#fff";
+          ctx.textAlign = "center";
+          ctx.textBaseline = "middle";
+          ctx.font = "12px sans-serif";
+          ctx.fillText(String(index + 1), point.x, point.y + 1);
+        }
+        ctx.restore();
+      }
+
+      function renderZoneList() {
+        els.zoneList.innerHTML = "";
+        if (!state.zones.length) {
+          const empty = document.createElement("div");
+          empty.className = "zone-row";
+          empty.textContent = "No saved zones.";
+          els.zoneList.append(empty);
+          return;
+        }
+        for (const zone of state.zones) {
+          const row = document.createElement("div");
+          row.className = "zone-row";
+          const badge = document.createElement("div");
+          badge.className = `badge ${Number(zone.score) === 1 ? "score-1" : "score-half"}`;
+          badge.textContent = String(zone.score);
+          const text = document.createElement("div");
+          text.textContent = `${zone.label || "zone"}: ${(zone.polygon_px || []).length} points`;
+          row.append(badge, text);
+          els.zoneList.append(row);
+        }
+      }
+
+      function updateButtons() {
+        els.finish.disabled = state.draft.length < 3;
+        els.undo.disabled = state.draft.length === 0;
+        els.clearDraft.disabled = state.draft.length === 0;
+        els.deleteLast.disabled = state.zones.length === 0;
+        els.clearZones.disabled = state.zones.length === 0;
+        els.save.disabled = state.zones.length === 0;
+        if (state.draft.length < 3) {
+          setStatus(`Click ${3 - state.draft.length} more point(s) to finish the current zone.`);
+        } else {
+          setStatus("Finish the current zone or continue adding points.");
+        }
+      }
+
+      async function fetchJson(path) {
+        const response = await fetch(path);
+        if (!response.ok) throw new Error(`Could not load ${path}`);
+        return response.json();
+      }
+
+      function setStatus(message, error = false) {
+        els.status.textContent = message;
+        els.status.className = error ? "status error" : "status";
+      }
+    </script>
+  </body>
+</html>

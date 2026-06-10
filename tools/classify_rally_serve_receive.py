@@ -39,6 +39,11 @@ class PlayerBox:
         x1, y1, x2, y2 = self.bbox
         return ((x1 + x2) / 2, y1 + (y2 - y1) * 0.25)
 
+    @property
+    def court_anchor(self) -> tuple[float, float]:
+        x1, _y1, x2, y2 = self.bbox
+        return ((x1 + x2) / 2, y2)
+
 
 @dataclass
 class BallState:
@@ -86,6 +91,7 @@ def main() -> int:
     parser.add_argument("--ball-track", required=True, help="Normalized ball CSV/JSON.")
     parser.add_argument("--tracking-json", required=True, help="test_track_video.py JSON with player tracks.")
     parser.add_argument("--layout", default="data/processed/calibrations/field_layout.json")
+    parser.add_argument("--reception-zones", default="data/processed/calibrations/reception_zones.json")
     parser.add_argument(
         "--team-filter",
         choices=["none", "court-intersection", "court-nearest-6"],
@@ -109,6 +115,12 @@ def main() -> int:
         type=float,
         default=0.33,
         help="Classify an action as receive when SVM wait probability is below this threshold.",
+    )
+    parser.add_argument(
+        "--receive-prob-threshold",
+        type=float,
+        default=0.33,
+        help="Mark the first action with receive_top or receive_bottom probability above this threshold as reception.",
     )
     parser.add_argument("--receiver-frame-window", type=int, default=4, help="Find nearest player within +/- this many frames.")
     parser.add_argument("--receiver-max-distance", type=float, default=180.0)
@@ -147,6 +159,7 @@ def main() -> int:
     ball_track_path = resolve_path(args.ball_track)
     tracking_path = resolve_path(args.tracking_json)
     layout_path = resolve_path(args.layout)
+    reception_zones_path = resolve_path(args.reception_zones)
     if not video_path.exists():
         raise SystemExit(f"Video not found: {video_path}")
     if not ball_track_path.exists():
@@ -179,6 +192,7 @@ def main() -> int:
         raise SystemExit("Not enough filtered ball points to classify the rally.")
 
     court_polygon = load_layout_polygon(layout_path) if args.team_filter != "none" else []
+    reception_zones = load_reception_zones(reception_zones_path)
     player_boxes_by_frame = load_player_boxes(tracking_path)
     player_boxes_by_frame = filter_player_boxes_by_team(player_boxes_by_frame, court_polygon, args.team_filter)
     player_boxes_by_frame = dedupe_player_boxes_by_label(player_boxes_by_frame)
@@ -196,12 +210,14 @@ def main() -> int:
         args=args,
         pose_classifier=pose_classifier,
     )
+    reception_evaluation = evaluate_reception_quality(actions, reception_zones, args.receive_prob_threshold)
     reception, receiver = first_receive_action(actions)
 
     output_dir = resolve_path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     stem = video_path.stem
     json_path = output_dir / f"{stem}_serve_receive.json"
+    reception_eval_path = output_dir / f"{stem}_reception_evaluation.json"
     annotated_path = output_dir / f"{stem}_serve_receive_annotated.mp4"
 
     result = {
@@ -210,6 +226,7 @@ def main() -> int:
         "ball_track": str(ball_track_path),
         "tracking_json": str(tracking_path),
         "layout": str(layout_path) if args.team_filter != "none" else None,
+        "reception_zones": str(reception_zones_path) if reception_zones else None,
         "player_team_filter": args.team_filter,
         "fps": fps,
         "raw_ball_points": len(raw_ball_points),
@@ -223,10 +240,15 @@ def main() -> int:
         },
         "serve": serve,
         "actions": actions,
+        "reception_evaluation": reception_evaluation,
         "reception": reception,
         "receiver": receiver,
     }
     json_path.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    reception_eval_path.write_text(
+        json.dumps(reception_evaluation, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
 
     if not args.no_video:
         write_annotated_video(
@@ -241,6 +263,8 @@ def main() -> int:
             player_tracks_by_id=player_tracks_by_id,
             serve=serve,
             actions=actions,
+            reception_evaluation=reception_evaluation,
+            reception_zones=reception_zones,
             label_hold_frames=max(1, int(round(args.label_hold_sec * fps))),
             player_draw_max_gap=args.player_draw_max_gap,
             trail_length=args.trail_length,
@@ -288,7 +312,18 @@ def main() -> int:
             )
             if pose_action.get("probabilities"):
                 print(f"First receiver action probabilities: {format_probability_vector(pose_action['probabilities'])}")
+    if reception_evaluation.get("ok"):
+        print(
+            f"Reception evaluation: receiver={reception_evaluation.get('receiver')} "
+            f"score={reception_evaluation.get('score')} reason={reception_evaluation.get('score_reason')}"
+        )
+        if reception_evaluation.get("pass"):
+            pass_info = reception_evaluation["pass"]
+            print(f"Pass: frame={pass_info.get('frame')} passer={pass_info.get('passer')}")
+    else:
+        print(f"Reception evaluation: unavailable ({reception_evaluation.get('reason')})")
     print(f"Saved JSON: {json_path}")
+    print(f"Saved reception evaluation: {reception_eval_path}")
     if not args.no_video:
         print(f"Saved annotated video: {annotated_path}")
     return 0
@@ -661,6 +696,27 @@ def load_layout_polygon(path: Path) -> list[tuple[float, float]]:
     return [(float(point["x"]), float(point["y"])) for point in points if "x" in point and "y" in point]
 
 
+def load_reception_zones(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    data = json.loads(path.read_text(encoding="utf-8"))
+    zones = []
+    for zone in data.get("zones", []):
+        points = zone.get("polygon_px") or []
+        polygon = [(float(point["x"]), float(point["y"])) for point in points if "x" in point and "y" in point]
+        if len(polygon) < 3:
+            continue
+        zones.append(
+            {
+                "zone_id": str(zone.get("zone_id") or f"score_{zone.get('score', 0)}"),
+                "label": str(zone.get("label") or ""),
+                "score": float(zone.get("score", 0)),
+                "polygon": polygon,
+            }
+        )
+    return zones
+
+
 def filter_player_boxes_by_team(
     boxes_by_frame: dict[int, list[PlayerBox]],
     polygon: list[tuple[float, float]],
@@ -865,6 +921,136 @@ def classify_action_type(action: dict[str, Any], wait_probability_threshold: flo
         predicted_label = str(pose_action.get("predicted_label") or "")
         return predicted_label if predicted_label and predicted_label != "wait" else "receive"
     return "wait"
+
+
+def evaluate_reception_quality(
+    actions: list[dict[str, Any]],
+    zones: list[dict[str, Any]],
+    receive_probability_threshold: float,
+) -> dict[str, Any]:
+    reception_action = first_action_with_receive_probability(actions, receive_probability_threshold)
+    if reception_action is None:
+        return {
+            "ok": False,
+            "reason": "no action with receive_top or receive_bottom above threshold",
+            "receive_probability_threshold": receive_probability_threshold,
+            "score": None,
+        }
+
+    reception_action["role"] = "reception"
+    reception_action["action_type"] = "reception"
+    reception_action["is_receive"] = True
+
+    pass_action = first_pass_action_after(actions, int(reception_action["frame"]))
+    receiver_id = player_label_from_action(reception_action)
+    result: dict[str, Any] = {
+        "ok": True,
+        "receive_probability_threshold": receive_probability_threshold,
+        "receiver": receiver_id,
+        "reception_frame": reception_action["frame"],
+        "reception_probabilities": receive_probabilities(reception_action),
+        "pass": None,
+        "score": -1,
+        "score_reason": "no pass action after reception",
+    }
+    if pass_action is None:
+        reception_action["reception_score"] = -1
+        return result
+
+    pass_action["role"] = "pass"
+    pass_action["action_type"] = "pass"
+    passer = pass_action.get("receiver") or {}
+    passer_anchor = court_anchor_from_receiver(passer)
+    pass_info = {
+        "frame": pass_action["frame"],
+        "passer": player_label_from_action(pass_action),
+        "vy_before_px_per_frame": pass_action.get("vy_before_px_per_frame"),
+        "vy_after_px_per_frame": pass_action.get("vy_after_px_per_frame"),
+        "court_anchor": {"x": passer_anchor[0], "y": passer_anchor[1]} if passer_anchor else None,
+    }
+    result["pass"] = pass_info
+    if passer_anchor is None:
+        result["score"] = 0
+        result["score_reason"] = "pass detected but passer box was unavailable"
+        reception_action["reception_score"] = 0
+        return result
+
+    zone = best_reception_zone_for_point(passer_anchor, zones)
+    if zone is None:
+        result["score"] = 0
+        result["score_reason"] = "pass detected outside marked scoring zones"
+        reception_action["reception_score"] = 0
+        return result
+
+    score = float(zone["score"])
+    result["score"] = score
+    result["score_reason"] = f"passer inside {zone['zone_id']}"
+    result["scoring_zone"] = {
+        "zone_id": zone["zone_id"],
+        "label": zone.get("label"),
+        "score": score,
+    }
+    reception_action["reception_score"] = score
+    return result
+
+
+def first_action_with_receive_probability(
+    actions: list[dict[str, Any]],
+    threshold: float,
+) -> dict[str, Any] | None:
+    for action in actions:
+        probabilities = receive_probabilities(action)
+        if max(probabilities.values(), default=0.0) >= threshold:
+            return action
+    return None
+
+
+def receive_probabilities(action: dict[str, Any]) -> dict[str, float]:
+    probabilities = ((action.get("receiver") or {}).get("pose_action") or {}).get("probabilities") or {}
+    return {
+        "receive_top": float(probabilities.get("receive_top", probabilities.get("recive_top", 0.0)) or 0.0),
+        "receive_bottom": float(probabilities.get("receive_bottom", probabilities.get("recive_bottom", 0.0)) or 0.0),
+    }
+
+
+def first_pass_action_after(actions: list[dict[str, Any]], reception_frame: int) -> dict[str, Any] | None:
+    for action in actions:
+        if int(action["frame"]) <= reception_frame:
+            continue
+        vy_before = action.get("vy_before_px_per_frame")
+        vy_after = action.get("vy_after_px_per_frame")
+        if vy_before is None or vy_after is None:
+            continue
+        if float(vy_before) > 0 and float(vy_after) < 0:
+            return action
+    return None
+
+
+def player_label_from_action(action: dict[str, Any]) -> str | None:
+    receiver = action.get("receiver") or {}
+    label = receiver.get("player_id") or receiver.get("track_id")
+    return str(label) if label is not None else None
+
+
+def court_anchor_from_receiver(receiver: dict[str, Any]) -> tuple[float, float] | None:
+    bbox = receiver.get("bbox") or {}
+    try:
+        x1 = float(bbox["x1"])
+        x2 = float(bbox["x2"])
+        y2 = float(bbox["y2"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return ((x1 + x2) / 2, y2)
+
+
+def best_reception_zone_for_point(
+    point: tuple[float, float],
+    zones: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    matches = [zone for zone in zones if point_in_polygon(point, zone["polygon"])]
+    if not matches:
+        return None
+    return max(matches, key=lambda zone: float(zone["score"]))
 
 
 def first_receive_action(actions: list[dict[str, Any]]) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
@@ -1408,6 +1594,8 @@ def write_annotated_video(
     player_tracks_by_id: dict[str, list[PlayerBox]],
     serve: dict[str, Any],
     actions: list[dict[str, Any]],
+    reception_evaluation: dict[str, Any],
+    reception_zones: list[dict[str, Any]],
     label_hold_frames: int,
     player_draw_max_gap: int,
     trail_length: int,
@@ -1427,15 +1615,39 @@ def write_annotated_video(
             history.append(ball)
         out = frame.copy()
         active_action = active_action_for_frame(actions, frame_idx, label_hold_frames)
+        draw_reception_zones(cv2, out, reception_zones)
         draw_ball(cv2, out, frame_idx, ball, history, trail_length)
         boxes = latest_player_boxes_near_frame(player_tracks_by_id, frame_idx, player_draw_max_gap)
         if not boxes:
             boxes = player_boxes_by_frame.get(frame_idx, [])
         draw_player_boxes(cv2, out, boxes, active_action)
-        draw_events(cv2, out, frame_idx, fps, serve, actions, active_action, label_hold_frames)
+        draw_events(cv2, out, frame_idx, fps, serve, actions, active_action, label_hold_frames, reception_evaluation)
         writer.write(out)
     cap.release()
     writer.release()
+
+
+def draw_reception_zones(cv2: Any, frame: Any, zones: list[dict[str, Any]]) -> None:
+    if not zones:
+        return
+    try:
+        import numpy as np  # type: ignore
+    except ModuleNotFoundError:
+        return
+
+    overlay = frame.copy()
+    for zone in zones:
+        polygon = zone.get("polygon") or []
+        if len(polygon) < 3:
+            continue
+        score = float(zone.get("score", 0.0))
+        color = (0, 150, 0) if score >= 1.0 else (0, 165, 255)
+        points = np.array([[int(x), int(y)] for x, y in polygon], dtype=np.int32)
+        cv2.fillPoly(overlay, [points], color)
+        cv2.polylines(frame, [points], isClosed=True, color=color, thickness=3)
+        label_x, label_y = points[0]
+        draw_label(cv2, frame, f"zone {score:g}", int(label_x) + 8, int(label_y) - 8, color, 0.65)
+    cv2.addWeighted(overlay, 0.18, frame, 0.82, 0, dst=frame)
 
 
 def draw_ball(cv2: Any, frame: Any, frame_idx: int, ball: BallPoint | None, history: list[BallPoint], trail_length: int) -> None:
@@ -1480,10 +1692,21 @@ def draw_events(
     actions: list[dict[str, Any]],
     active_action: dict[str, Any] | None,
     hold: int,
+    reception_evaluation: dict[str, Any],
 ) -> None:
     lines = [f"serve: {serve['serving_team']} team"]
+    if reception_evaluation.get("ok"):
+        lines.append(
+            f"reception score: {reception_evaluation.get('score')} "
+            f"receiver: {reception_evaluation.get('receiver') or 'none'}"
+        )
+    elif reception_evaluation:
+        lines.append("reception score: unavailable")
     if active_action is not None:
-        lines.append(f"{active_action.get('action_type', 'action')}: {active_action['frame'] / fps:.2f}s")
+        action_line = f"{active_action.get('action_type', 'action')}: {active_action['frame'] / fps:.2f}s"
+        if active_action.get("role") == "reception" and active_action.get("reception_score") is not None:
+            action_line += f" score={active_action['reception_score']}"
+        lines.append(action_line)
     receiver = active_action.get("receiver") if active_action else None
     if receiver is not None:
         prefix = "DISPUTED " if receiver["disputed"] else ""
@@ -1499,8 +1722,15 @@ def draw_events(
         draw_label(cv2, frame, "SERVE", int(serve["x"]) + 12, int(serve["y"]), (255, 120, 0), 0.75)
     for action in actions:
         if abs(frame_idx - int(action["frame"])) <= hold:
-            color = (0, 180, 255) if action.get("action_type") == "wait" else (0, 0, 255)
-            label = str(action.get("action_type") or "ACTION").upper()
+            if action.get("role") == "reception":
+                color = (0, 0, 255)
+                label = f"RECEPTION {action.get('reception_score', '')}".strip()
+            elif action.get("role") == "pass":
+                color = (255, 80, 0)
+                label = "PASS"
+            else:
+                color = (0, 180, 255) if action.get("action_type") == "wait" else (0, 0, 255)
+                label = str(action.get("action_type") or "ACTION").upper()
             cv2.drawMarker(frame, (int(action["x"]), int(action["y"])), color, cv2.MARKER_CROSS, 44, 4)
             draw_label(cv2, frame, label, int(action["x"]) + 12, int(action["y"]), color, 0.75)
 
