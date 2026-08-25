@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from temporal_args import resolve_temporal_option
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -100,16 +102,20 @@ def main() -> int:
     )
     parser.add_argument("--output-dir", default="data/processed/rally_classification")
     parser.add_argument("--max-frames", type=int, default=0)
-    parser.add_argument("--serve-window", type=int, default=14, help="Frames used to score a smooth early serve flight.")
+    parser.add_argument("--serve-window-sec", type=float, default=14 / 30, help="Seconds used to score a smooth early serve flight.")
+    parser.add_argument("--serve-window", dest="serve_window_frames", type=int, default=None, help="Deprecated frame override for --serve-window-sec.")
     parser.add_argument("--serve-search-ratio", type=float, default=0.55, help="Search serve in the first N ratio of the clip.")
     parser.add_argument("--serve-min-speed", type=float, default=8.0, help="Minimum average ball speed in px/frame for a serve flight.")
     parser.add_argument("--serve-min-distance", type=float, default=120.0, help="Minimum total ball displacement for a serve flight.")
     parser.add_argument("--serve-max-mean-angle-change", type=float, default=38.0, help="Max mean trajectory angle change inside a smooth serve flight.")
     parser.add_argument("--serve-early-bonus", type=float, default=0.35, help="How strongly to prefer earlier smooth serve flights.")
     parser.add_argument("--reception-min-angle-change", type=float, default=135.0)
-    parser.add_argument("--reception-window", type=int, default=4)
-    parser.add_argument("--reception-min-frame-gap", type=int, default=6, help="Skip this many frames after serve before searching reception.")
-    parser.add_argument("--action-min-frame-gap", type=int, default=12, help="Group sharp ball changes closer than this many frames into one action.")
+    parser.add_argument("--reception-window-sec", type=float, default=4 / 30, help="Seconds before/after a ball point used to estimate trajectory change.")
+    parser.add_argument("--reception-window", dest="reception_window_frames", type=int, default=None, help="Deprecated frame override for --reception-window-sec.")
+    parser.add_argument("--reception-min-gap-sec", type=float, default=5 / 30, help="Seconds to skip after the serve window before searching for reception.")
+    parser.add_argument("--reception-min-frame-gap", dest="reception_min_gap_frames", type=int, default=None, help="Deprecated frame override for --reception-min-gap-sec.")
+    parser.add_argument("--action-min-gap-sec", type=float, default=12 / 30, help="Group sharp ball changes closer than this many seconds into one action.")
+    parser.add_argument("--action-min-frame-gap", dest="action_min_gap_frames", type=int, default=None, help="Deprecated frame override for --action-min-gap-sec.")
     parser.add_argument(
         "--receive-wait-prob-threshold",
         type=float,
@@ -122,10 +128,12 @@ def main() -> int:
         default=0.33,
         help="Mark the first action with receive_top or receive_bottom probability above this threshold as reception.",
     )
-    parser.add_argument("--receiver-frame-window", type=int, default=4, help="Find nearest player within +/- this many frames.")
+    parser.add_argument("--receiver-window-sec", type=float, default=4 / 30, help="Find the nearest player within +/- this many seconds.")
+    parser.add_argument("--receiver-frame-window", dest="receiver_window_frames", type=int, default=None, help="Deprecated frame override for --receiver-window-sec.")
     parser.add_argument("--receiver-max-distance", type=float, default=180.0)
     parser.add_argument("--receiver-dispute-margin", type=float, default=35.0)
-    parser.add_argument("--player-draw-max-gap", type=int, default=12, help="Draw the latest player box within this many frames, matching test_track_video.py.")
+    parser.add_argument("--player-draw-max-gap-sec", type=float, default=12 / 30, help="Draw the latest player box within this many seconds, matching test_track_video.py.")
+    parser.add_argument("--player-draw-max-gap", dest="player_draw_max_gap_frames", type=int, default=None, help="Deprecated frame override for --player-draw-max-gap-sec.")
     parser.add_argument(
         "--pose-svm-model",
         default=None,
@@ -142,13 +150,17 @@ def main() -> int:
         default=0.20,
         help="MediaPipe pose confidence threshold for action SVM crops.",
     )
-    parser.add_argument("--max-ball-gap", type=int, default=0)
+    parser.add_argument("--max-ball-gap-sec", type=float, default=0.0, help="Seconds of missing ball detections to fill with predicted points.")
+    parser.add_argument("--max-ball-gap", dest="max_ball_gap_frames", type=int, default=None, help="Deprecated frame override for --max-ball-gap-sec.")
     parser.add_argument("--ball-max-jump", type=float, default=100.0)
-    parser.add_argument("--ball-reacquire-gap", type=int, default=5)
+    parser.add_argument("--ball-reacquire-gap-sec", type=float, default=5 / 30, help="Missing-ball seconds before using the relaxed reacquisition jump limit.")
+    parser.add_argument("--ball-reacquire-gap", dest="ball_reacquire_gap_frames", type=int, default=None, help="Deprecated frame override for --ball-reacquire-gap-sec.")
     parser.add_argument("--ball-reacquire-max-jump", type=float, default=1000.0)
-    parser.add_argument("--ball-reset-gap", type=int, default=5)
+    parser.add_argument("--ball-reset-gap-sec", type=float, default=5 / 30, help="Missing/rejected-ball seconds before resetting tracking state.")
+    parser.add_argument("--ball-reset-gap", dest="ball_reset_gap_frames", type=int, default=None, help="Deprecated frame override for --ball-reset-gap-sec.")
     parser.add_argument("--label-hold-sec", type=float, default=1.5)
-    parser.add_argument("--trail-length", type=int, default=45)
+    parser.add_argument("--trail-length-sec", type=float, default=45 / 30, help="Seconds of recent ball history drawn on the video.")
+    parser.add_argument("--trail-length", dest="trail_length_frames", type=int, default=None, help="Deprecated frame override for --trail-length-sec.")
     parser.add_argument("--no-video", action="store_true")
     args = parser.parse_args()
 
@@ -177,6 +189,10 @@ def main() -> int:
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     max_frames = args.max_frames if args.max_frames > 0 else frame_count
+    try:
+        temporal_parameters = resolve_temporal_parameters(args, fps)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
 
     raw_ball_points = load_ball_track(ball_track_path)
     ball_points = filter_ball_track(
@@ -229,6 +245,7 @@ def main() -> int:
         "reception_zones": str(reception_zones_path) if reception_zones else None,
         "player_team_filter": args.team_filter,
         "fps": fps,
+        "temporal_parameters": temporal_parameters,
         "raw_ball_points": len(raw_ball_points),
         "filtered_ball_points": len(ball_points),
         "assumptions": {
@@ -327,6 +344,76 @@ def main() -> int:
     if not args.no_video:
         print(f"Saved annotated video: {annotated_path}")
     return 0
+
+
+def resolve_temporal_parameters(args: argparse.Namespace, fps: float) -> dict[str, dict[str, Any]]:
+    specifications = [
+        ("serve_window", "serve_window_sec", "serve_window_frames", "--serve-window-sec", "--serve-window", 1),
+        ("reception_window", "reception_window_sec", "reception_window_frames", "--reception-window-sec", "--reception-window", 1),
+        (
+            "reception_min_frame_gap",
+            "reception_min_gap_sec",
+            "reception_min_gap_frames",
+            "--reception-min-gap-sec",
+            "--reception-min-frame-gap",
+            0,
+        ),
+        (
+            "action_min_frame_gap",
+            "action_min_gap_sec",
+            "action_min_gap_frames",
+            "--action-min-gap-sec",
+            "--action-min-frame-gap",
+            0,
+        ),
+        (
+            "receiver_frame_window",
+            "receiver_window_sec",
+            "receiver_window_frames",
+            "--receiver-window-sec",
+            "--receiver-frame-window",
+            0,
+        ),
+        (
+            "player_draw_max_gap",
+            "player_draw_max_gap_sec",
+            "player_draw_max_gap_frames",
+            "--player-draw-max-gap-sec",
+            "--player-draw-max-gap",
+            0,
+        ),
+        ("max_ball_gap", "max_ball_gap_sec", "max_ball_gap_frames", "--max-ball-gap-sec", "--max-ball-gap", 0),
+        (
+            "ball_reacquire_gap",
+            "ball_reacquire_gap_sec",
+            "ball_reacquire_gap_frames",
+            "--ball-reacquire-gap-sec",
+            "--ball-reacquire-gap",
+            1,
+        ),
+        (
+            "ball_reset_gap",
+            "ball_reset_gap_sec",
+            "ball_reset_gap_frames",
+            "--ball-reset-gap-sec",
+            "--ball-reset-gap",
+            1,
+        ),
+        ("trail_length", "trail_length_sec", "trail_length_frames", "--trail-length-sec", "--trail-length", 1),
+    ]
+    resolved = {}
+    for target, seconds_attr, frames_attr, seconds_option, frames_option, minimum in specifications:
+        resolved[target] = resolve_temporal_option(
+            args,
+            fps=fps,
+            target_attr=target,
+            seconds_attr=seconds_attr,
+            legacy_frames_attr=frames_attr,
+            seconds_option=seconds_option,
+            legacy_frames_option=frames_option,
+            minimum_frames=minimum,
+        )
+    return resolved
 
 
 def import_dependencies() -> dict[str, Any]:

@@ -190,9 +190,9 @@ Create a cleaned ball-only debug video and cleaned JSON. This applies jump filte
   --players off \
   --ball-track "$BALL_TRACK" \
   --ball-source vball-net \
-  --max-ball-gap 0 \
+  --max-ball-gap-sec 0 \
   --ball-max-jump 100 \
-  --ball-reset-gap 5 \
+  --ball-reset-gap-sec 0.17 \
   --team-filter none \
   --tracker iou \
   --ocr off \
@@ -219,13 +219,13 @@ This labels the six near-side players using YOLO, ByteTrack, PaddleOCR, roster f
   --embeddings "$EMBEDDINGS" \
   --ball-track "$CLEAN_BALL_TRACK" \
   --ball-source vball-net \
-  --max-ball-gap 0 \
+  --max-ball-gap-sec 0 \
   --ball-max-jump 100 \
-  --ball-reset-gap 5 \
+  --ball-reset-gap-sec 0.17 \
   --team-filter court-nearest-6 \
   --fill-roster-labels \
   --predict-missing-players \
-  --max-player-prediction-gap 45 \
+  --max-player-prediction-gap-sec 1.5 \
   --tracker bytetrack \
   --frame-stride 1 \
   --device 0 \
@@ -271,10 +271,13 @@ This creates the final annotated rally video. It uses the cleaned ball track, th
   --pose-min-detection-confidence 0.20 \
   --receive-prob-threshold 0.33 \
   --receive-wait-prob-threshold 0.33 \
-  --max-ball-gap 0 \
+  --max-ball-gap-sec 0 \
   --ball-max-jump 100 \
-  --ball-reset-gap 5 \
-  --serve-window 14 \
+  --ball-reset-gap-sec 0.17 \
+  --serve-window-sec 0.47 \
+  --reception-window-sec 0.13 \
+  --reception-min-gap-sec 0.17 \
+  --action-min-gap-sec 0.40 \
   --serve-min-speed 8 \
   --serve-min-distance 120 \
   --serve-max-mean-angle-change 38 \
@@ -294,8 +297,11 @@ Use `--team-filter none` here because player filtering was already done in the p
 ## Notes
 
 - `--ball-max-jump 100` rejects a ball detection if it jumps more than 100 pixels from the predicted position during continuous tracking.
-- `--ball-reset-gap 5` resets ball state after 5 consecutive missing or rejected detections, allowing reacquisition.
-- `--max-ball-gap 0` disables filling missing ball frames with predicted ball points.
+- Temporal thresholds use seconds and are converted to frame counts from each video's measured FPS. This keeps equivalent behavior at 30, 60, and 120 FPS.
+- `--ball-reset-gap-sec 0.17` resets ball state after approximately 0.17 seconds of missing or rejected detections, allowing reacquisition.
+- `--max-ball-gap-sec 0` disables filling missing ball time with predicted ball points.
+- `--reception-min-gap-sec 0.17` ignores trajectory changes immediately after the detected serve window. The default is about 5 frames at 30 FPS, 10 at 60 FPS, and 20 at 120 FPS.
+- The old frame options such as `--ball-reset-gap`, `--max-ball-gap`, `--serve-window`, and `--reception-min-frame-gap` remain as deprecated explicit overrides for older commands.
 - `--team-filter court-nearest-6` keeps six detected players near the marked near-side court.
 - `--tracker bytetrack` gives more stable player tracks than frame-by-frame YOLO boxes.
 - `--fill-roster-labels` tries to keep every roster player labeled.

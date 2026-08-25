@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from temporal_args import resolve_temporal_option
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -85,7 +87,8 @@ def main() -> int:
     parser.add_argument("--vball-output-dir", default="data/processed/vball_net_raw")
     parser.add_argument("--output-dir", default="data/processed/technical_actions")
     parser.add_argument("--max-frames", type=int, default=0, help="0 means process the whole clip.")
-    parser.add_argument("--trail-length", type=int, default=45)
+    parser.add_argument("--trail-length-sec", type=float, default=45 / 30, help="Seconds of recent ball history to draw.")
+    parser.add_argument("--trail-length", dest="trail_length_frames", type=int, default=None, help="Deprecated frame override for --trail-length-sec.")
     parser.add_argument(
         "--action-scope",
         choices=["all", "near-side"],
@@ -93,32 +96,36 @@ def main() -> int:
         help="Use all ball trajectory changes, or only lower/near-side image points.",
     )
     parser.add_argument("--near-side-y-ratio", type=float, default=0.42, help="For --action-scope near-side, only consider contacts below this image ratio.")
-    parser.add_argument("--analysis-window", type=int, default=4, help="Frames before/after point for velocity estimate.")
+    parser.add_argument("--analysis-window-sec", type=float, default=4 / 30, help="Seconds before/after a point used for velocity estimation.")
+    parser.add_argument("--analysis-window", dest="analysis_window_frames", type=int, default=None, help="Deprecated frame override for --analysis-window-sec.")
     parser.add_argument("--min-angle-change", type=float, default=45.0)
     parser.add_argument("--min-speed-change-ratio", type=float, default=0.20)
     parser.add_argument("--min-score", type=float, default=0.45)
     parser.add_argument("--label-hold-sec", type=float, default=2.0)
     parser.add_argument("--max-moments", type=int, default=12)
-    parser.add_argument("--max-ball-gap", type=int, default=0, help="Predict ball position through this many hidden frames.")
+    parser.add_argument("--max-ball-gap-sec", type=float, default=0.0, help="Seconds of missing ball detections to fill with predicted points.")
+    parser.add_argument("--max-ball-gap", dest="max_ball_gap_frames", type=int, default=None, help="Deprecated frame override for --max-ball-gap-sec.")
     parser.add_argument("--ball-max-jump", type=float, default=100.0, help="Reject ball detections farther than this many pixels from the predicted ball position.")
     parser.add_argument(
-        "--ball-reacquire-gap",
-        type=int,
-        default=5,
-        help="After this many consecutive missing ball frames, use --ball-reacquire-max-jump for the next real detection.",
+        "--ball-reacquire-gap-sec",
+        type=float,
+        default=5 / 30,
+        help="After this many missing-ball seconds, use --ball-reacquire-max-jump for the next real detection.",
     )
+    parser.add_argument("--ball-reacquire-gap", dest="ball_reacquire_gap_frames", type=int, default=None, help="Deprecated frame override for --ball-reacquire-gap-sec.")
     parser.add_argument(
         "--ball-reacquire-max-jump",
         type=float,
         default=1000.0,
-        help="Temporary ball jump limit used after --ball-reacquire-gap missing frames.",
+        help="Temporary ball jump limit used after the ball reacquisition gap.",
     )
     parser.add_argument(
-        "--ball-reset-gap",
-        type=int,
-        default=5,
-        help="After this many consecutive rejected/missing ball frames, reset ball state so tracking can restart anywhere.",
+        "--ball-reset-gap-sec",
+        type=float,
+        default=5 / 30,
+        help="After this many rejected/missing-ball seconds, reset ball state so tracking can restart anywhere.",
     )
+    parser.add_argument("--ball-reset-gap", dest="ball_reset_gap_frames", type=int, default=None, help="Deprecated frame override for --ball-reset-gap-sec.")
     parser.add_argument("--no-video", action="store_true", help="Only write JSON.")
     args = parser.parse_args()
 
@@ -143,6 +150,10 @@ def main() -> int:
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     max_frames = args.max_frames if args.max_frames > 0 else frame_count
+    try:
+        temporal_parameters = resolve_temporal_parameters(args, fps)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     raw_ball_count = len(ball_points)
     ball_points = filter_ball_track(
         points=ball_points,
@@ -246,6 +257,7 @@ def main() -> int:
             "ball_reacquire_max_jump": args.ball_reacquire_max_jump,
             "ball_reset_gap": args.ball_reset_gap,
         },
+        "temporal_parameters": temporal_parameters,
         "raw_ball_points": raw_ball_count,
         "filtered_ball_points": len(ball_points),
         "technical_action_moments": [moment_to_dict(moment, fps) for moment in moments],
@@ -256,6 +268,50 @@ def main() -> int:
     if writer:
         print(f"Saved labeled video: {annotated_path}")
     return 0
+
+
+def resolve_temporal_parameters(args: argparse.Namespace, fps: float) -> dict[str, dict[str, Any]]:
+    specifications = [
+        ("trail_length", "trail_length_sec", "trail_length_frames", "--trail-length-sec", "--trail-length", 1),
+        (
+            "analysis_window",
+            "analysis_window_sec",
+            "analysis_window_frames",
+            "--analysis-window-sec",
+            "--analysis-window",
+            1,
+        ),
+        ("max_ball_gap", "max_ball_gap_sec", "max_ball_gap_frames", "--max-ball-gap-sec", "--max-ball-gap", 0),
+        (
+            "ball_reacquire_gap",
+            "ball_reacquire_gap_sec",
+            "ball_reacquire_gap_frames",
+            "--ball-reacquire-gap-sec",
+            "--ball-reacquire-gap",
+            1,
+        ),
+        (
+            "ball_reset_gap",
+            "ball_reset_gap_sec",
+            "ball_reset_gap_frames",
+            "--ball-reset-gap-sec",
+            "--ball-reset-gap",
+            1,
+        ),
+    ]
+    resolved = {}
+    for target, seconds_attr, frames_attr, seconds_option, frames_option, minimum in specifications:
+        resolved[target] = resolve_temporal_option(
+            args,
+            fps=fps,
+            target_attr=target,
+            seconds_attr=seconds_attr,
+            legacy_frames_attr=frames_attr,
+            seconds_option=seconds_option,
+            legacy_frames_option=frames_option,
+            minimum_frames=minimum,
+        )
+    return resolved
 
 
 def import_dependencies() -> dict[str, Any]:

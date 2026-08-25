@@ -17,6 +17,7 @@ from typing import Any
 from jersey_ocr import JerseyOCR, OCRIdentity, normalize_name, normalize_number as normalize_jersey_number
 from player_roster import PlayerRoster, load_roster
 from reid_osnet import OSNetEmbedder
+from temporal_args import resolve_temporal_option
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -235,12 +236,8 @@ def main() -> int:
         action="store_true",
         help="Predict missing roster-labeled player boxes from track velocity so labels stay visible through short detector misses.",
     )
-    parser.add_argument(
-        "--max-player-prediction-gap",
-        type=int,
-        default=45,
-        help="Maximum frames to keep predicting a roster-labeled player after detector/tracker misses.",
-    )
+    parser.add_argument("--max-player-prediction-gap-sec", type=float, default=45 / 30, help="Maximum seconds to predict a roster-labeled player after detector/tracker misses.")
+    parser.add_argument("--max-player-prediction-gap", dest="max_player_prediction_gap_frames", type=int, default=None, help="Deprecated frame override for --max-player-prediction-gap-sec.")
     parser.add_argument("--max-frames", type=int, default=0, help="0 means process the whole clip.")
     parser.add_argument(
         "--match-threshold",
@@ -248,27 +245,33 @@ def main() -> int:
         default=1.05,
         help="Max L2 distance for assigning a player label. Use 0 to force nearest labels.",
     )
-    parser.add_argument("--trail-length", type=int, default=45, help="Number of recent ball points to draw.")
-    parser.add_argument("--max-ball-gap", type=int, default=18, help="Predict ball position through this many hidden frames.")
+    parser.add_argument("--trail-length-sec", type=float, default=45 / 30, help="Seconds of recent ball history to draw.")
+    parser.add_argument("--trail-length", dest="trail_length_frames", type=int, default=None, help="Deprecated frame override for --trail-length-sec.")
+    parser.add_argument("--player-draw-max-gap-sec", type=float, default=12 / 30, help="Seconds to keep drawing the latest player box after a missed detection.")
+    parser.add_argument("--player-draw-max-gap", dest="player_draw_max_gap_frames", type=int, default=None, help="Deprecated frame override for --player-draw-max-gap-sec.")
+    parser.add_argument("--max-ball-gap-sec", type=float, default=18 / 30, help="Seconds of missing ball detections to fill with predicted points.")
+    parser.add_argument("--max-ball-gap", dest="max_ball_gap_frames", type=int, default=None, help="Deprecated frame override for --max-ball-gap-sec.")
     parser.add_argument("--ball-max-jump", type=float, default=95.0, help="Reject ball detections farther than this many pixels from the predicted ball position in one frame.")
     parser.add_argument(
-        "--ball-reacquire-gap",
-        type=int,
-        default=5,
-        help="After this many consecutive missing ball frames, use --ball-reacquire-max-jump for the next accepted real detection.",
+        "--ball-reacquire-gap-sec",
+        type=float,
+        default=5 / 30,
+        help="After this many missing-ball seconds, use --ball-reacquire-max-jump for the next accepted real detection.",
     )
+    parser.add_argument("--ball-reacquire-gap", dest="ball_reacquire_gap_frames", type=int, default=None, help="Deprecated frame override for --ball-reacquire-gap-sec.")
     parser.add_argument(
         "--ball-reacquire-max-jump",
         type=float,
         default=1000.0,
-        help="Temporary ball jump limit used after --ball-reacquire-gap missing frames.",
+        help="Temporary ball jump limit used after the ball reacquisition gap.",
     )
     parser.add_argument(
-        "--ball-reset-gap",
-        type=int,
-        default=45,
-        help="After this many consecutive rejected/missing ball frames, reset ball state so tracking can restart anywhere.",
+        "--ball-reset-gap-sec",
+        type=float,
+        default=45 / 30,
+        help="After this many rejected/missing-ball seconds, reset ball state so tracking can restart anywhere.",
     )
+    parser.add_argument("--ball-reset-gap", dest="ball_reset_gap_frames", type=int, default=None, help="Deprecated frame override for --ball-reset-gap-sec.")
     parser.add_argument(
         "--ball-source",
         choices=["auto", "vball-net", "yolo", "motion"],
@@ -336,6 +339,10 @@ def main() -> int:
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     max_frames = args.max_frames if args.max_frames > 0 else frame_count
+    try:
+        temporal_parameters = resolve_temporal_parameters(args, fps)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
 
     writer = None
     annotated_path = output_dir / f"{output_stem}_annotated.mp4"
@@ -491,7 +498,7 @@ def main() -> int:
 
         if players_enabled:
             visible_player_detections.append(
-                serialize_visible_player_detections(player_tracks, frame_idx, max_gap=12)
+                serialize_visible_player_detections(player_tracks, frame_idx, max_gap=args.player_draw_max_gap)
             )
 
         if writer:
@@ -505,6 +512,7 @@ def main() -> int:
                 ball_track=ball_track,
                 team_filter=args.team_filter,
                 trail_length=args.trail_length,
+                player_draw_max_gap=args.player_draw_max_gap,
             )
             writer.write(annotated)
 
@@ -519,6 +527,8 @@ def main() -> int:
         "video_id": output_stem,
         "video_path": str(video_path),
         "frame_count_processed": frame_idx + 1,
+        "fps": fps,
+        "temporal_parameters": temporal_parameters,
         "team_filter": args.team_filter,
         "ball_track": [ball.__dict__ for ball in ball_track],
         "player_tracks": serialize_tracks(player_tracks),
@@ -544,6 +554,58 @@ def main() -> int:
     if not player_tracks:
         print("Warning: no player tracks found. Your saved field polygon may be too narrow; try --team-filter largest.")
     return 0
+
+
+def resolve_temporal_parameters(args: argparse.Namespace, fps: float) -> dict[str, dict[str, Any]]:
+    specifications = [
+        (
+            "max_player_prediction_gap",
+            "max_player_prediction_gap_sec",
+            "max_player_prediction_gap_frames",
+            "--max-player-prediction-gap-sec",
+            "--max-player-prediction-gap",
+            0,
+        ),
+        ("trail_length", "trail_length_sec", "trail_length_frames", "--trail-length-sec", "--trail-length", 1),
+        (
+            "player_draw_max_gap",
+            "player_draw_max_gap_sec",
+            "player_draw_max_gap_frames",
+            "--player-draw-max-gap-sec",
+            "--player-draw-max-gap",
+            0,
+        ),
+        ("max_ball_gap", "max_ball_gap_sec", "max_ball_gap_frames", "--max-ball-gap-sec", "--max-ball-gap", 0),
+        (
+            "ball_reacquire_gap",
+            "ball_reacquire_gap_sec",
+            "ball_reacquire_gap_frames",
+            "--ball-reacquire-gap-sec",
+            "--ball-reacquire-gap",
+            1,
+        ),
+        (
+            "ball_reset_gap",
+            "ball_reset_gap_sec",
+            "ball_reset_gap_frames",
+            "--ball-reset-gap-sec",
+            "--ball-reset-gap",
+            1,
+        ),
+    ]
+    resolved = {}
+    for target, seconds_attr, frames_attr, seconds_option, frames_option, minimum in specifications:
+        resolved[target] = resolve_temporal_option(
+            args,
+            fps=fps,
+            target_attr=target,
+            seconds_attr=seconds_attr,
+            legacy_frames_attr=frames_attr,
+            seconds_option=seconds_option,
+            legacy_frames_option=frames_option,
+            minimum_frames=minimum,
+        )
+    return resolved
 
 
 def load_or_create_ball_track(
@@ -1958,6 +2020,7 @@ def draw_debug_frame(
     ball_track: list[BallObservation],
     team_filter: str,
     trail_length: int,
+    player_draw_max_gap: int,
 ) -> Any:
     cv2 = deps["cv2"]
     np = deps["np"]
@@ -1967,7 +2030,7 @@ def draw_debug_frame(
         cv2.polylines(out, [pts], isClosed=True, color=(0, 220, 120), thickness=3)
     visible_detections = []
     for track in tracks:
-        det = latest_detection_near_frame(track, current_frame, max_gap=12)
+        det = latest_detection_near_frame(track, current_frame, max_gap=player_draw_max_gap)
         if not det:
             continue
         visible_detections.append((track, det))

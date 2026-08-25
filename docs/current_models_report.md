@@ -23,7 +23,7 @@ The best current player marking command is:
   --team-filter court-nearest-6 \
   --fill-roster-labels \
   --predict-missing-players \
-  --max-player-prediction-gap 45 \
+  --max-player-prediction-gap-sec 1.5 \
   --tracker bytetrack \
   --reid auto \
   --ocr auto \
@@ -236,7 +236,7 @@ Important flags:
 
 ```bash
 --predict-missing-players
---max-player-prediction-gap 45
+--max-player-prediction-gap-sec 1.5
 ```
 
 How it works:
@@ -245,7 +245,7 @@ How it works:
 - It predicts a temporary box for that player.
 - This keeps labels moving smoothly instead of disappearing immediately.
 
-This prediction is only useful after a player has already been detected and labeled at least once.
+This prediction is only useful after a player has already been detected and labeled at least once. Temporal options are expressed in seconds and converted from the video's measured FPS, so 1.5 seconds behaves consistently at 30, 60, and 120 FPS.
 
 ## Current Best Behavior
 
