@@ -9,7 +9,7 @@ The pipeline is:
 3. Prepare roster and player embeddings.
 4. Run fast volleyball ball tracking.
 5. Clean the ball track.
-6. Label the six nearest-team players.
+6. Track every player, classify tracks by team, and resolve identities from complete tracklets.
 7. Classify serve, receive, and technical actions with the pose SVM.
 
 ## 0. Set Variables
@@ -210,9 +210,11 @@ $CLEAN_OUT_DIR/${STEM}_test_tracking.csv
 
 Use `$CLEAN_BALL_TRACK` for the rest of the pipeline, not the raw `$BALL_TRACK`.
 
-## 8. Label Nearest-Team Players
+## 8. Track All Players, Classify Teams, And Resolve Tracklets
 
-This labels the six near-side players using YOLO, ByteTrack, PaddleOCR, roster filling, missing-player prediction, and OSNet/SoccerNet ReID fallback.
+This detects and tracks every person before making a team decision. Team classification and identity resolution run offline over complete tracklets, so strong evidence found later can label earlier frames. Near-team players have blue frames, opposing players have red frames, and insufficient evidence remains `unknown` instead of receiving a forced roster label.
+
+The `sportsmix` tracker is a lightweight implementation of the association ideas in [SportsMOT](https://openaccess.thecvf.com/content/ICCV2023/html/Cui_SportsMOT_A_Large_Multi-Object_Tracking_Dataset_in_Multiple_Sports_Scenes_ICCV_2023_paper.html) and [MixSort](https://github.com/MCG-NJU/MixSort): predicted motion and IoU are fused with OSNet appearance, appearance templates are not updated from overlapped crops, and tracks survive short occlusions. It does not claim to reproduce MixSort's learned MixFormer model.
 
 ```bash
 ./venv/bin/python tools/test_track_video.py "$VIDEO" \
@@ -222,11 +224,22 @@ This labels the six near-side players using YOLO, ByteTrack, PaddleOCR, roster f
   --max-ball-gap-sec 0 \
   --ball-max-jump 100 \
   --ball-reset-gap-sec 0.17 \
-  --team-filter court-nearest-6 \
-  --fill-roster-labels \
-  --predict-missing-players \
-  --max-player-prediction-gap-sec 1.5 \
-  --tracker bytetrack \
+  --team-filter none \
+  --track-all-players \
+  --tracklet-team-classification \
+  --tracklet-identity \
+  --split-tracklets-on-appearance-change \
+  --tracklet-split-color-distance 60 \
+  --tracklet-split-min-observations 6 \
+  --interpolate-track-gaps \
+  --interpolate-track-gap-sec 0.75 \
+  --tracker sportsmix \
+  --sportsmix-max-age-sec 0.75 \
+  --sportsmix-match-threshold 0.92 \
+  --sportsmix-motion-weight 0.55 \
+  --sportsmix-appearance-weight 0.35 \
+  --sportsmix-center-weight 0.10 \
+  --sportsmix-template-overlap-iou 0.25 \
   --frame-stride 1 \
   --device 0 \
   --reid auto \
@@ -239,9 +252,11 @@ This labels the six near-side players using YOLO, ByteTrack, PaddleOCR, roster f
   --ocr-min-confidence 0.85 \
   --ocr-relabel-min-confidence 0.92 \
   --ocr-skip-overlap-iou 0.25 \
-  --reid-relabel-max-center-jump 100 \
   --ocr-every-n-frames 5 \
-  --match-threshold 0 \
+  --match-threshold 1.05 \
+  --tracklet-reid-threshold 0.92 \
+  --tracklet-reid-margin 0.06 \
+  --tracklet-reid-min-confidence 0.12 \
   --output-dir "$OUT_DIR"
 ```
 
@@ -264,7 +279,7 @@ This creates the final annotated rally video. It uses the cleaned ball track, th
   --ball-track "$CLEAN_BALL_TRACK" \
   --tracking-json "$TRACKING_JSON" \
   --reception-zones data/processed/calibrations/reception_zones.json \
-  --team-filter none \
+  --team-filter classified-near \
   --output-dir data/processed/rally_classification \
   --pose-svm-model "$POSE_SVM" \
   --pose-model "$POSE_MODEL" \
@@ -292,7 +307,29 @@ data/processed/rally_classification/${STEM}_serve_receive.json
 data/processed/rally_classification/${STEM}_reception_evaluation.json
 ```
 
-Use `--team-filter none` here because player filtering was already done in the player-labeling step.
+`--team-filter classified-near` uses only tracklets classified as the near team for action-to-player assignment. The final video still draws opposing tracks in red.
+
+## Volleydzen Tracking Ablation
+
+The checked evaluation points are stored in `tests/fixtures/volleydzen_test_tracking_eval.json`: player 9's overhead reception at frame 40, player 8's set at frame 78, player 10's attack at frame 89, and three opposing-player boxes.
+
+| Experiment | Correct action identities | Opponents marked red | Result |
+| --- | ---: | ---: | --- |
+| Legacy nearest-six + forced labels | 1/3 | 0/3 | Baseline |
+| Track all people | 2/3 | 0/3 | Improved setter coverage |
+| Then classify teams | 2/3 | 3/3 | Improved team separation |
+| Then whole-track identity + interpolation | 2/3 | 3/3 | No additional contact-score gain; safer unknown/future propagation |
+| SportsMOT-inspired association, no appearance split | 3/3 | 1/3 | Improved attack continuity, but one mixed tracklet remained |
+| SportsMOT-inspired association + appearance change split | 3/3 | 3/3 | Best tested configuration |
+
+Reproduce the scoring after running experiments:
+
+```bash
+./venv/bin/python tools/evaluate_tracking_experiment.py \
+  final=data/processed/volleydzen_test_tracking_final/volleydzen_test_test_tracking.json \
+  --config tests/fixtures/volleydzen_test_tracking_eval.json \
+  --output data/processed/volleydzen_test_tracking_final/evaluation.json
+```
 
 ## Notes
 
@@ -302,10 +339,11 @@ Use `--team-filter none` here because player filtering was already done in the p
 - `--max-ball-gap-sec 0` disables filling missing ball time with predicted ball points.
 - `--reception-min-gap-sec 0.17` ignores trajectory changes immediately after the detected serve window. The default is about 5 frames at 30 FPS, 10 at 60 FPS, and 20 at 120 FPS.
 - The old frame options such as `--ball-reset-gap`, `--max-ball-gap`, `--serve-window`, and `--reception-min-frame-gap` remain as deprecated explicit overrides for older commands.
-- `--team-filter court-nearest-6` keeps six detected players near the marked near-side court.
-- `--tracker bytetrack` gives more stable player tracks than frame-by-frame YOLO boxes.
-- `--fill-roster-labels` tries to keep every roster player labeled.
-- `--predict-missing-players` predicts a missing player's box from recent velocity.
+- `--track-all-players` deliberately postpones team classification until after tracking.
+- `--tracker sportsmix` fuses motion/IoU with OSNet appearance and freezes appearance-template updates during overlap.
+- `--split-tracklets-on-appearance-change` cuts a track if association followed a different uniform through an overlap.
+- `--tracklet-identity` assigns one identity from all clean OCR/ReID evidence in a tracklet and propagates it to earlier frames.
+- Ambiguous tracklets remain `unknown`; roster labels are never filled by position alone.
 - `--ocr-every-n-frames 5` runs OCR every 5 frames for better relabeling. Use larger values such as `15` or `30` when speed matters because PaddleOCR is heavy.
 - `--ocr-min-confidence 0.85` filters weak OCR reads.
 - `--ocr-relabel-min-confidence 0.92` requires stronger OCR before changing an existing player label.

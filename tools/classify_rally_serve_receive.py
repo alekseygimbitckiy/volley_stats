@@ -35,6 +35,8 @@ class PlayerBox:
     player_id: str | None
     bbox: tuple[float, float, float, float]
     confidence: float | None
+    team: str = "unknown"
+    observed: bool = True
 
     @property
     def upper_anchor(self) -> tuple[float, float]:
@@ -96,8 +98,8 @@ def main() -> int:
     parser.add_argument("--reception-zones", default="data/processed/calibrations/reception_zones.json")
     parser.add_argument(
         "--team-filter",
-        choices=["none", "court-intersection", "court-nearest-6"],
-        default="court-nearest-6",
+        choices=["none", "classified-near", "court-intersection", "court-nearest-6"],
+        default="classified-near",
         help="Filter player boxes from the tracking JSON before assigning actions.",
     )
     parser.add_argument("--output-dir", default="data/processed/rally_classification")
@@ -132,6 +134,18 @@ def main() -> int:
     parser.add_argument("--receiver-frame-window", dest="receiver_window_frames", type=int, default=None, help="Deprecated frame override for --receiver-window-sec.")
     parser.add_argument("--receiver-max-distance", type=float, default=180.0)
     parser.add_argument("--receiver-dispute-margin", type=float, default=35.0)
+    parser.add_argument(
+        "--receiver-known-player-bonus",
+        type=float,
+        default=110.0,
+        help="Pixel-equivalent preference for an identified player over an unknown track.",
+    )
+    parser.add_argument(
+        "--receiver-prediction-penalty",
+        type=float,
+        default=35.0,
+        help="Pixel-equivalent penalty for an unobserved/predicted player box.",
+    )
     parser.add_argument("--player-draw-max-gap-sec", type=float, default=12 / 30, help="Draw the latest player box within this many seconds, matching test_track_video.py.")
     parser.add_argument("--player-draw-max-gap", dest="player_draw_max_gap_frames", type=int, default=None, help="Deprecated frame override for --player-draw-max-gap-sec.")
     parser.add_argument(
@@ -209,10 +223,14 @@ def main() -> int:
 
     court_polygon = load_layout_polygon(layout_path) if args.team_filter != "none" else []
     reception_zones = load_reception_zones(reception_zones_path)
-    player_boxes_by_frame = load_player_boxes(tracking_path)
-    player_boxes_by_frame = filter_player_boxes_by_team(player_boxes_by_frame, court_polygon, args.team_filter)
+    render_player_boxes_by_frame = dedupe_player_boxes_by_label(load_player_boxes(tracking_path))
+    player_boxes_by_frame = filter_player_boxes_by_team(
+        render_player_boxes_by_frame,
+        court_polygon,
+        args.team_filter,
+    )
     player_boxes_by_frame = dedupe_player_boxes_by_label(player_boxes_by_frame)
-    player_tracks_by_id = player_tracks_from_boxes(player_boxes_by_frame)
+    render_player_tracks_by_id = player_tracks_from_boxes(render_player_boxes_by_frame)
     serve, reception = classify_serve_and_reception(ball_points, max_frames, args)
     serve["time_sec"] = serve["frame"] / fps
     pose_classifier = load_pose_classifier(args) if args.pose_svm_model else None
@@ -276,8 +294,8 @@ def main() -> int:
             size=(width, height),
             max_frames=max_frames,
             ball_points=ball_points,
-            player_boxes_by_frame=player_boxes_by_frame,
-            player_tracks_by_id=player_tracks_by_id,
+            player_boxes_by_frame=render_player_boxes_by_frame,
+            player_tracks_by_id=render_player_tracks_by_id,
             serve=serve,
             actions=actions,
             reception_evaluation=reception_evaluation,
@@ -755,6 +773,8 @@ def load_player_boxes(path: Path) -> dict[int, list[PlayerBox]]:
                 player_id=det.get("player_id"),
                 bbox=(float(bbox["x1"]), float(bbox["y1"]), float(bbox["x2"]), float(bbox["y2"])),
                 confidence=det.get("confidence"),
+                team=str(det.get("team") or track.get("team") or "unknown"),
+                observed=bool(det.get("observed", True)),
             )
             by_frame.setdefault(frame, []).append(box)
     return by_frame
@@ -772,6 +792,8 @@ def load_visible_player_boxes(rows: list[dict[str, Any]]) -> dict[int, list[Play
                 player_id=det.get("player_id") or det.get("raw_player_id"),
                 bbox=(float(bbox["x1"]), float(bbox["y1"]), float(bbox["x2"]), float(bbox["y2"])),
                 confidence=det.get("confidence"),
+                team=str(det.get("team") or "unknown"),
+                observed=bool(det.get("observed", True)),
             )
             by_frame.setdefault(frame, []).append(box)
     return by_frame
@@ -809,7 +831,14 @@ def filter_player_boxes_by_team(
     polygon: list[tuple[float, float]],
     mode: str,
 ) -> dict[int, list[PlayerBox]]:
-    if mode == "none" or not polygon:
+    if mode == "none":
+        return boxes_by_frame
+    if mode == "classified-near":
+        return {
+            frame: [box for box in boxes if box.team == "near"]
+            for frame, boxes in boxes_by_frame.items()
+        }
+    if not polygon:
         return boxes_by_frame
     filtered = {}
     for frame, boxes in boxes_by_frame.items():
@@ -967,6 +996,8 @@ def classify_actions_after_serve(
             frame_window=args.receiver_frame_window,
             max_distance=args.receiver_max_distance,
             dispute_margin=args.receiver_dispute_margin,
+            known_player_bonus=args.receiver_known_player_bonus,
+            prediction_penalty=args.receiver_prediction_penalty,
         )
         if action["receiver"] is not None and pose_classifier is not None:
             action["receiver"]["pose_action"] = predict_receiver_action(
@@ -1431,24 +1462,35 @@ def find_receiver(
     frame_window: int,
     max_distance: float,
     dispute_margin: float,
+    known_player_bonus: float = 110.0,
+    prediction_penalty: float = 35.0,
 ) -> dict[str, Any] | None:
     center_frame = round_frame(reception_frame)
-    candidates = []
+    best_by_track: dict[str, tuple[float, float, int, PlayerBox]] = {}
     for offset in range(-frame_window, frame_window + 1):
         frame = center_frame + offset
         for box in player_boxes_by_frame.get(frame, []):
             ax, ay = box.upper_anchor
             distance = math.hypot(ball_x - ax, ball_y - ay)
             if distance <= max_distance:
-                candidates.append((distance, abs(offset), box))
+                adjusted_distance = distance
+                if box.player_id:
+                    adjusted_distance -= max(0.0, known_player_bonus)
+                if not box.observed:
+                    adjusted_distance += max(0.0, prediction_penalty)
+                candidate = (adjusted_distance, distance, abs(offset), box)
+                current = best_by_track.get(box.track_id)
+                if current is None or candidate[:3] < current[:3]:
+                    best_by_track[box.track_id] = candidate
+    candidates = list(best_by_track.values())
     if not candidates:
         return None
-    candidates.sort(key=lambda item: (item[0], item[1]))
-    best_distance, best_offset, best_box = candidates[0]
+    candidates.sort(key=lambda item: item[:3])
+    best_adjusted, best_distance, best_offset, best_box = candidates[0]
     disputed = False
     alternatives = []
-    for distance, offset, box in candidates[1:4]:
-        if distance - best_distance <= dispute_margin:
+    for adjusted, distance, offset, box in candidates[1:4]:
+        if adjusted - best_adjusted <= dispute_margin:
             disputed = True
             alternatives.append(receiver_candidate_to_dict(box, distance, offset))
     result = receiver_candidate_to_dict(best_box, best_distance, best_offset)
@@ -1760,11 +1802,23 @@ def draw_player_boxes(cv2: Any, frame: Any, boxes: list[PlayerBox], active_actio
     receiver_pose_action = receiver.get("pose_action") if receiver else None
     for box in boxes:
         x1, y1, x2, y2 = [int(value) for value in box.bbox]
-        color = (0, 255, 0) if receiver_track and box.track_id == receiver_track else (180, 180, 180)
+        if receiver_track and box.track_id == receiver_track:
+            color = (0, 255, 0)
+        elif box.team == "opponent":
+            color = (0, 0, 255)
+        elif box.team == "near":
+            color = (255, 160, 0)
+        else:
+            color = (0, 215, 255)
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
         ax, ay = box.upper_anchor
         cv2.circle(frame, (int(ax), int(ay)), 5, color, -1)
-        label = box.player_id or f"track_{box.track_id}"
+        if box.team == "opponent":
+            label = f"opponent track_{box.track_id}"
+        elif box.player_id:
+            label = box.player_id
+        else:
+            label = f"unknown track_{box.track_id}"
         if receiver_track and box.track_id == receiver_track and receiver_pose_action and receiver_pose_action.get("ok"):
             label = f"{label} {format_probability_vector(receiver_pose_action['probabilities'])}"
         draw_label(cv2, frame, label, x1, max(20, y1 - 8), color, 0.55)

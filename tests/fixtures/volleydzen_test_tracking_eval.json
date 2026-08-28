@@ -1,0 +1,38 @@
+{
+  "video": "data/game/volleydzen_test.mp4",
+  "fps": 30.0,
+  "targets": [
+    {
+      "action": "overhead_receive",
+      "frame": 40,
+      "expected_player_id": "jersey_9",
+      "bbox": {"x1": 615.5, "y1": 546.7, "x2": 760.5, "y2": 782.5}
+    },
+    {
+      "action": "setter_pass",
+      "frame": 78,
+      "expected_player_id": "jersey_8",
+      "bbox": {"x1": 999.4, "y1": 503.3, "x2": 1039.5, "y2": 639.3}
+    },
+    {
+      "action": "attack",
+      "frame": 89,
+      "expected_player_id": "jersey_10",
+      "bbox": {"x1": 868.0, "y1": 450.0, "x2": 935.0, "y2": 565.0}
+    }
+  ],
+  "opponent_targets": [
+    {
+      "frame": 40,
+      "bbox": {"x1": 1073.6, "y1": 536.7, "x2": 1123.0, "y2": 675.9}
+    },
+    {
+      "frame": 78,
+      "bbox": {"x1": 1056.1, "y1": 542.4, "x2": 1119.7, "y2": 680.6}
+    },
+    {
+      "frame": 78,
+      "bbox": {"x1": 1414.9, "y1": 546.0, "x2": 1462.4, "y2": 688.8}
+    }
+  ]
+}

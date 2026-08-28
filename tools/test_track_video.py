@@ -17,7 +17,8 @@ from typing import Any
 from jersey_ocr import JerseyOCR, OCRIdentity, normalize_name, normalize_number as normalize_jersey_number
 from player_roster import PlayerRoster, load_roster
 from reid_osnet import OSNetEmbedder
-from temporal_args import resolve_temporal_option
+from sportsmix_tracker import SportsMixTracker
+from temporal_args import resolve_temporal_option, seconds_to_frames
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -36,6 +37,13 @@ class PlayerDetection:
     shirt_name: str | None = None
     shirt_name_confidence: float | None = None
     identity_source: str | None = None
+    team: str = "unknown"
+    team_confidence: float = 0.0
+    team_source: str | None = None
+    uniform_color: tuple[float, float, float] | None = None
+    overlap_iou: float = 0.0
+    observed: bool = True
+    prediction_age: int = 0
 
 
 @dataclass
@@ -43,6 +51,13 @@ class PlayerTrack:
     track_id: int | str
     detections: list[PlayerDetection] = field(default_factory=list)
     missed: int = 0
+    team: str = "unknown"
+    team_confidence: float = 0.0
+    team_source: str | None = None
+    resolved_player_id: str | None = None
+    identity_confidence: float = 0.0
+    identity_source: str | None = None
+    hard_end_frame: int | None = None
 
     @property
     def last_bbox(self) -> tuple[float, float, float, float]:
@@ -200,7 +215,7 @@ def main() -> int:
     parser.add_argument("--roster", default=None, help="JSON file with real player_id, jersey_number, and names/aliases.")
     parser.add_argument("--roster-name-threshold", type=float, default=0.78)
     parser.add_argument("--roster-name-margin", type=float, default=0.05)
-    parser.add_argument("--tracker", choices=["bytetrack", "deepsort", "iou"], default="deepsort")
+    parser.add_argument("--tracker", choices=["sportsmix", "bytetrack", "deepsort", "iou"], default="sportsmix")
     parser.add_argument("--bytetrack-high-thresh", type=float, default=0.25)
     parser.add_argument("--bytetrack-low-thresh", type=float, default=0.10)
     parser.add_argument("--bytetrack-new-track-thresh", type=float, default=0.25)
@@ -209,6 +224,13 @@ def main() -> int:
     parser.add_argument("--deepsort-max-age", type=int, default=30)
     parser.add_argument("--deepsort-n-init", type=int, default=1)
     parser.add_argument("--deepsort-max-cosine-distance", type=float, default=0.7)
+    parser.add_argument("--sportsmix-max-age-sec", type=float, default=0.75, help="Seconds to keep a motion/appearance track alive through occlusion.")
+    parser.add_argument("--sportsmix-match-threshold", type=float, default=0.92)
+    parser.add_argument("--sportsmix-motion-weight", type=float, default=0.55)
+    parser.add_argument("--sportsmix-appearance-weight", type=float, default=0.35)
+    parser.add_argument("--sportsmix-center-weight", type=float, default=0.10)
+    parser.add_argument("--sportsmix-max-center-distance", type=float, default=3.0, help="Maximum center displacement in average box heights.")
+    parser.add_argument("--sportsmix-template-overlap-iou", type=float, default=0.25, help="Do not update an appearance template from crops at or above this overlap.")
     parser.add_argument("--frame-stride", type=int, default=3, help="Run player detector every N frames.")
     parser.add_argument("--person-nms-iou", type=float, default=0.55, help="Suppress duplicate person boxes above this IoU.")
     parser.add_argument(
@@ -238,6 +260,48 @@ def main() -> int:
     )
     parser.add_argument("--max-player-prediction-gap-sec", type=float, default=45 / 30, help="Maximum seconds to predict a roster-labeled player after detector/tracker misses.")
     parser.add_argument("--max-player-prediction-gap", dest="max_player_prediction_gap_frames", type=int, default=None, help="Deprecated frame override for --max-player-prediction-gap-sec.")
+    parser.add_argument(
+        "--track-all-players",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Track every detected person before assigning near/opposing team labels.",
+    )
+    parser.add_argument(
+        "--tracklet-team-classification",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Classify near/opposing team from complete tracks after tracking.",
+    )
+    parser.add_argument("--tracklet-team-color-threshold", type=float, default=52.0)
+    parser.add_argument("--tracklet-team-color-margin", type=float, default=10.0)
+    parser.add_argument("--tracklet-team-reid-min-confidence", type=float, default=0.12)
+    parser.add_argument("--tracklet-team-dark-value-threshold", type=float, default=45.0)
+    parser.add_argument("--tracklet-team-dark-reid-confidence", type=float, default=0.30)
+    parser.add_argument(
+        "--tracklet-identity",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Resolve identity from the complete track and propagate future evidence backward.",
+    )
+    parser.add_argument("--tracklet-reid-threshold", type=float, default=0.92)
+    parser.add_argument("--tracklet-reid-margin", type=float, default=0.06)
+    parser.add_argument("--tracklet-reid-min-confidence", type=float, default=0.12)
+    parser.add_argument("--tracklet-ocr-min-confidence", type=float, default=0.85)
+    parser.add_argument(
+        "--split-tracklets-on-appearance-change",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Split an associated track when its sustained uniform appearance changes abruptly.",
+    )
+    parser.add_argument("--tracklet-split-color-distance", type=float, default=60.0)
+    parser.add_argument("--tracklet-split-min-observations", type=int, default=6)
+    parser.add_argument(
+        "--interpolate-track-gaps",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Interpolate short internal track gaps after later detections reconnect the player.",
+    )
+    parser.add_argument("--interpolate-track-gap-sec", type=float, default=0.75)
     parser.add_argument("--max-frames", type=int, default=0, help="0 means process the whole clip.")
     parser.add_argument(
         "--match-threshold",
@@ -303,21 +367,24 @@ def main() -> int:
     players_enabled = args.players != "off"
     player_refs: list[dict[str, Any]] = []
     embedding_info: dict[str, Any] = {}
+    player_galleries: dict[str, list[list[float]]] = {}
+    team_color_samples: list[tuple[float, float, float]] = []
     roster = None
     if players_enabled:
-        player_refs, embedding_info = load_player_embeddings(Path(args.embeddings))
+        embeddings_path = Path(args.embeddings)
+        player_refs, embedding_info = load_player_embeddings(embeddings_path)
         roster = load_roster(args.roster, args.roster_name_threshold, args.roster_name_margin)
         if roster is not None:
             player_refs = merge_roster_refs(player_refs, roster)
             print(f"Loaded roster players: {len(roster.players)}")
         configure_embedding_backend(deps, embedding_info, args.embedding_device, enabled=args.reid != "off")
         configure_ocr_backend(deps, args, embedding_info, player_refs)
+        player_galleries, team_color_samples = load_player_sample_galleries(embeddings_path, deps)
     else:
         deps["reid_embedder"] = None
         print("Player detection disabled; producing ball-only output.")
     external_ball_track = load_or_create_ball_track(args, video_path)
     model = deps["YOLO"](args.yolo_model)
-    player_tracker = create_player_tracker(args) if players_enabled else None
     uniform_samples = []
     if players_enabled and args.uniform_color_filter and args.uniform_color_source == "embeddings":
         uniform_samples = load_uniform_color_samples(Path(args.embeddings), deps, args.uniform_color_max_samples)
@@ -343,12 +410,23 @@ def main() -> int:
         temporal_parameters = resolve_temporal_parameters(args, fps)
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
+    args.sportsmix_max_age = seconds_to_frames(args.sportsmix_max_age_sec, fps, minimum=1)
+    args.interpolate_track_gap = seconds_to_frames(args.interpolate_track_gap_sec, fps, minimum=1)
+    temporal_parameters["sportsmix_max_age"] = temporal_parameter_summary(
+        args.sportsmix_max_age_sec,
+        args.sportsmix_max_age,
+        fps,
+        "--sportsmix-max-age-sec",
+    )
+    temporal_parameters["interpolate_track_gap"] = temporal_parameter_summary(
+        args.interpolate_track_gap_sec,
+        args.interpolate_track_gap,
+        fps,
+        "--interpolate-track-gap-sec",
+    )
+    player_tracker = create_player_tracker(args) if players_enabled else None
 
-    writer = None
     annotated_path = output_dir / f"{output_stem}_annotated.mp4"
-    if not args.no_video:
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(str(annotated_path), fourcc, fps, (width, height))
 
     bg = cv2.createBackgroundSubtractorMOG2(history=120, varThreshold=18, detectShadows=False)
     player_tracks: list[PlayerTrack] = []
@@ -377,7 +455,7 @@ def main() -> int:
 
         yolo_ball_candidates: list[BallObservation] = []
         should_detect_model = (
-            (players_enabled and (args.tracker == "bytetrack" or frame_idx % max(1, args.frame_stride) == 0))
+            (players_enabled and (args.tracker in {"sportsmix", "bytetrack"} or frame_idx % max(1, args.frame_stride) == 0))
             or args.ball_source in ("auto", "yolo")
         )
         detections: list[PlayerDetection] = []
@@ -401,14 +479,17 @@ def main() -> int:
                 team_candidates = []
             else:
                 person_candidates = suppress_duplicate_person_boxes(person_candidates, args.person_nms_iou)
-                team_candidates = filter_team_candidates(
-                    person_candidates,
-                    layout,
-                    width,
-                    height,
-                    mode=args.team_filter,
-                )
-                team_candidates = uniform_filter.filter_candidates(deps, frame, team_candidates)
+                if args.track_all_players:
+                    team_candidates = person_candidates
+                else:
+                    team_candidates = filter_team_candidates(
+                        person_candidates,
+                        layout,
+                        width,
+                        height,
+                        mode=args.team_filter,
+                    )
+                    team_candidates = uniform_filter.filter_candidates(deps, frame, team_candidates)
                 detections = build_player_detections(
                     deps=deps,
                     frame=frame,
@@ -421,7 +502,17 @@ def main() -> int:
                     roster=roster,
                     use_reid=args.reid != "off",
                 )
-        if players_enabled and args.tracker == "bytetrack":
+        if players_enabled and args.tracker == "sportsmix":
+            update_sportsmix_player_tracks(
+                player_tracker,
+                player_tracks,
+                detections,
+                frame_idx,
+                ocr_relabel_min_confidence=args.ocr_relabel_min_confidence,
+            )
+            last_player_detections = current_tracker_detections(player_tracks, frame_idx)
+            player_boxes_for_ball = [det.bbox for det in last_player_detections]
+        elif players_enabled and args.tracker == "bytetrack":
             update_bytetrack_player_tracks(
                 player_tracker,
                 player_tracks,
@@ -431,9 +522,6 @@ def main() -> int:
                 max_missed=max_tracker_missed(args),
                 ocr_relabel_min_confidence=args.ocr_relabel_min_confidence,
             )
-            fill_current_roster_labels(player_tracks, frame_idx, roster, player_refs, args.fill_roster_labels, use_reid=args.reid != "off", reid_max_center_jump=args.reid_relabel_max_center_jump)
-            predict_missing_roster_tracks(player_tracks, frame_idx, roster, width, height, args.predict_missing_players)
-            fill_current_roster_labels(player_tracks, frame_idx, roster, player_refs, args.fill_roster_labels, use_reid=args.reid != "off", reid_max_center_jump=args.reid_relabel_max_center_jump)
             last_player_detections = current_tracker_detections(player_tracks, frame_idx)
             player_boxes_for_ball = [det.bbox for det in last_player_detections]
         elif players_enabled and args.tracker == "deepsort":
@@ -445,9 +533,6 @@ def main() -> int:
                 max_missed=max_tracker_missed(args),
                 ocr_relabel_min_confidence=args.ocr_relabel_min_confidence,
             )
-            fill_current_roster_labels(player_tracks, frame_idx, roster, player_refs, args.fill_roster_labels, use_reid=args.reid != "off", reid_max_center_jump=args.reid_relabel_max_center_jump)
-            predict_missing_roster_tracks(player_tracks, frame_idx, roster, width, height, args.predict_missing_players)
-            fill_current_roster_labels(player_tracks, frame_idx, roster, player_refs, args.fill_roster_labels, use_reid=args.reid != "off", reid_max_center_jump=args.reid_relabel_max_center_jump)
             last_player_detections = current_tracker_detections(player_tracks, frame_idx)
             player_boxes_for_ball = [det.bbox for det in last_player_detections]
         elif players_enabled and should_detect_model:
@@ -459,6 +544,10 @@ def main() -> int:
             )
             if deps.get("reid_embedder") is None:
                 finalize_track_labels(player_tracks)
+            last_player_detections = current_tracker_detections(player_tracks, frame_idx)
+            player_boxes_for_ball = [det.bbox for det in last_player_detections]
+
+        if players_enabled and not args.tracklet_identity:
             fill_current_roster_labels(player_tracks, frame_idx, roster, player_refs, args.fill_roster_labels, use_reid=args.reid != "off", reid_max_center_jump=args.reid_relabel_max_center_jump)
             predict_missing_roster_tracks(player_tracks, frame_idx, roster, width, height, args.predict_missing_players)
             fill_current_roster_labels(player_tracks, frame_idx, roster, player_refs, args.fill_roster_labels, use_reid=args.reid != "off", reid_max_center_jump=args.reid_relabel_max_center_jump)
@@ -496,32 +585,69 @@ def main() -> int:
         if ball:
             ball_track.append(ball)
 
-        if players_enabled:
-            visible_player_detections.append(
-                serialize_visible_player_detections(player_tracks, frame_idx, max_gap=args.player_draw_max_gap)
-            )
-
-        if writer:
-            annotated = draw_debug_frame(
-                deps=deps,
-                frame=frame,
-                near_polygon=layout,
-                tracks=player_tracks,
-                current_frame=frame_idx,
-                ball=ball,
-                ball_track=ball_track,
-                team_filter=args.team_filter,
-                trail_length=args.trail_length,
-                player_draw_max_gap=args.player_draw_max_gap,
-            )
-            writer.write(annotated)
-
         if frame_idx % 100 == 0:
             print(f"  frame {frame_idx}: tracks={len(player_tracks)} ball_points={len(ball_track)}")
 
     cap.release()
-    if writer:
-        writer.release()
+
+    if players_enabled:
+        if args.split_tracklets_on_appearance_change:
+            player_tracks = split_tracklets_on_appearance_change(
+                player_tracks,
+                deps["np"],
+                threshold=args.tracklet_split_color_distance,
+                min_observations=args.tracklet_split_min_observations,
+            )
+        if args.interpolate_track_gaps:
+            interpolate_internal_track_gaps(player_tracks, args.interpolate_track_gap)
+        if args.tracklet_team_classification:
+            classify_track_teams(
+                player_tracks,
+                layout,
+                team_color_samples,
+                player_galleries,
+                deps["np"],
+                color_threshold=args.tracklet_team_color_threshold,
+                color_margin=args.tracklet_team_color_margin,
+                reid_threshold=args.tracklet_reid_threshold,
+                reid_margin=args.tracklet_reid_margin,
+                reid_min_confidence=args.tracklet_team_reid_min_confidence,
+                dark_value_threshold=args.tracklet_team_dark_value_threshold,
+                dark_reid_confidence=args.tracklet_team_dark_reid_confidence,
+            )
+        else:
+            apply_legacy_track_teams(player_tracks, layout)
+        if args.tracklet_identity:
+            resolve_tracklet_identities(
+                player_tracks,
+                roster,
+                player_galleries,
+                reid_threshold=args.tracklet_reid_threshold,
+                reid_margin=args.tracklet_reid_margin,
+                reid_min_confidence=args.tracklet_reid_min_confidence,
+                ocr_min_confidence=args.tracklet_ocr_min_confidence,
+            )
+        visible_player_detections = [
+            serialize_visible_player_detections(player_tracks, frame, max_gap=args.player_draw_max_gap)
+            for frame in range(frame_idx + 1)
+        ]
+
+    if not args.no_video:
+        render_annotated_video(
+            deps=deps,
+            video_path=video_path,
+            output_path=annotated_path,
+            fps=fps,
+            width=width,
+            height=height,
+            max_frames=frame_idx + 1,
+            near_polygon=layout,
+            tracks=player_tracks,
+            ball_track=ball_track,
+            team_filter="tracklet" if args.tracklet_team_classification else args.team_filter,
+            trail_length=args.trail_length,
+            player_draw_max_gap=args.player_draw_max_gap,
+        )
 
     result = {
         "video_id": output_stem,
@@ -530,6 +656,25 @@ def main() -> int:
         "fps": fps,
         "temporal_parameters": temporal_parameters,
         "team_filter": args.team_filter,
+        "player_pipeline": {
+            "tracker": args.tracker,
+            "track_all_players": args.track_all_players,
+            "tracklet_team_classification": args.tracklet_team_classification,
+            "tracklet_identity": args.tracklet_identity,
+            "interpolate_track_gaps": args.interpolate_track_gaps,
+            "split_tracklets_on_appearance_change": args.split_tracklets_on_appearance_change,
+            "association_method": (
+                "sportsmix_lite_motion_iou_osnet_overlap_safe"
+                if args.tracker == "sportsmix"
+                else args.tracker
+            ),
+            "sportsmix_note": (
+                "SportsMOT/MixSort-inspired association using the existing OSNet model; "
+                "not the paper's learned MixFormer checkpoint."
+                if args.tracker == "sportsmix"
+                else None
+            ),
+        },
         "ball_track": [ball.__dict__ for ball in ball_track],
         "player_tracks": serialize_tracks(player_tracks),
         "visible_player_detections": visible_player_detections,
@@ -543,7 +688,7 @@ def main() -> int:
     print(f"Player tracks: {len(player_tracks)}")
     print(f"Saved JSON: {json_path}")
     print(f"Saved CSV: {csv_path}")
-    if writer:
+    if not args.no_video:
         print(f"Saved annotated video: {annotated_path}")
 
     if not ball_track:
@@ -606,6 +751,15 @@ def resolve_temporal_parameters(args: argparse.Namespace, fps: float) -> dict[st
             minimum_frames=minimum,
         )
     return resolved
+
+
+def temporal_parameter_summary(seconds: float, frames: int, fps: float, option: str) -> dict[str, Any]:
+    return {
+        "seconds": float(seconds),
+        "frames": int(frames),
+        "fps": float(fps),
+        "source": option,
+    }
 
 
 def load_or_create_ball_track(
@@ -757,6 +911,38 @@ def load_player_embeddings(path: Path) -> tuple[list[dict[str, Any]], dict[str, 
     return refs, data.get("embedding", {})
 
 
+def load_player_sample_galleries(
+    embeddings_path: Path,
+    deps: dict[str, Any],
+) -> tuple[dict[str, list[list[float]]], list[tuple[float, float, float]]]:
+    """Load per-player samples instead of collapsing identity to one centroid."""
+    cv2 = deps["cv2"]
+    data = json.loads(embeddings_path.read_text(encoding="utf-8"))
+    galleries: dict[str, list[list[float]]] = {}
+    team_colors: list[tuple[float, float, float]] = []
+    for sample in data.get("samples", []):
+        player_id = str(sample.get("player_id") or "").strip()
+        embedding = sample.get("embedding") or []
+        if player_id and embedding:
+            galleries.setdefault(player_id, []).append([float(value) for value in embedding])
+
+        snapshot_path = sample.get("snapshot_path")
+        if not snapshot_path:
+            continue
+        image = cv2.imread(str(resolve_project_path(snapshot_path)))
+        if image is None:
+            continue
+        color = extract_uniform_color_from_crop(deps, image)
+        if color is not None:
+            team_colors.append(color)
+    print(
+        "Loaded tracklet galleries: "
+        f"{sum(len(samples) for samples in galleries.values())} samples for {len(galleries)} players; "
+        f"{len(team_colors)} near-team color samples"
+    )
+    return galleries, team_colors
+
+
 def load_uniform_color_samples(
     embeddings_path: Path,
     deps: dict[str, Any],
@@ -861,6 +1047,16 @@ def merge_roster_refs(player_refs: list[dict[str, Any]], roster: PlayerRoster) -
 def create_player_tracker(args: argparse.Namespace) -> Any:
     if args.tracker == "iou":
         return None
+    if args.tracker == "sportsmix":
+        return SportsMixTracker(
+            max_age=args.sportsmix_max_age,
+            match_threshold=args.sportsmix_match_threshold,
+            motion_weight=args.sportsmix_motion_weight,
+            appearance_weight=args.sportsmix_appearance_weight,
+            center_weight=args.sportsmix_center_weight,
+            max_center_distance=args.sportsmix_max_center_distance,
+            overlap_iou=args.sportsmix_template_overlap_iou,
+        )
     if args.tracker == "bytetrack":
         try:
             from ultralytics.trackers.byte_tracker import BYTETracker  # type: ignore
@@ -956,16 +1152,14 @@ def extract_uniform_color(
     height, width = frame.shape[:2]
     x1, y1, x2, y2, _confidence = candidate
 
-    box_width = max(1.0, x2 - x1)
-    box_height = max(1.0, y2 - y1)
-    torso_x1 = int(max(0, min(width - 1, x1 + box_width * 0.18)))
-    torso_x2 = int(max(0, min(width, x2 - box_width * 0.18)))
-    torso_y1 = int(max(0, min(height - 1, y1 + box_height * 0.18)))
-    torso_y2 = int(max(0, min(height, y1 + box_height * 0.62)))
-    if torso_x2 <= torso_x1 or torso_y2 <= torso_y1:
+    person_x1 = int(max(0, min(width - 1, x1)))
+    person_x2 = int(max(0, min(width, x2)))
+    person_y1 = int(max(0, min(height - 1, y1)))
+    person_y2 = int(max(0, min(height, y2)))
+    if person_x2 <= person_x1 or person_y2 <= person_y1:
         return None
 
-    crop = frame[torso_y1:torso_y2, torso_x1:torso_x2]
+    crop = frame[person_y1:person_y2, person_x1:person_x2]
     if crop.size == 0:
         return None
     return extract_uniform_color_from_crop(deps, crop)
@@ -979,13 +1173,18 @@ def extract_uniform_color_from_crop(
     np = deps["np"]
     if crop is None or crop.size == 0:
         return None
-    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-    saturation = hsv[:, :, 1]
-    value = hsv[:, :, 2]
-    mask = (saturation >= 25) & (value >= 35) & (value <= 245)
-    pixels = hsv[mask]
-    if len(pixels) < 24:
-        pixels = hsv.reshape(-1, 3)
+    height, width = crop.shape[:2]
+    torso = crop[
+        int(height * 0.18) : max(int(height * 0.19) + 1, int(height * 0.62)),
+        int(width * 0.18) : max(int(width * 0.19) + 1, int(width * 0.82)),
+    ]
+    if torso.size == 0:
+        torso = crop
+    hsv = cv2.cvtColor(torso, cv2.COLOR_BGR2HSV)
+    # Dark pixels are essential evidence: the opposing team in the test clip
+    # wears black. The old saturation/value mask discarded the jersey itself
+    # and classified skin or court pixels instead.
+    pixels = hsv.reshape(-1, 3)
     if len(pixels) == 0:
         return None
     median = np.median(pixels.astype("float32"), axis=0)
@@ -1099,7 +1298,8 @@ def build_player_detections(
         if crop.size == 0:
             continue
         embedding = compute_crop_embedding(deps, crop)
-        can_read_ocr = ocr_enabled and not candidate_overlaps_other(candidates, idx, ocr_overlap_iou)
+        max_overlap = candidate_max_overlap(candidates, idx)
+        can_read_ocr = ocr_enabled and (ocr_overlap_iou <= 0 or max_overlap < ocr_overlap_iou)
         name_identity, number_identity = read_crop_identities(deps, crop, can_read_ocr)
         jersey_number = number_identity.value if number_identity is not None else None
         jersey_confidence = number_identity.confidence if number_identity is not None else None
@@ -1118,6 +1318,8 @@ def build_player_detections(
                 shirt_name=shirt_name,
                 shirt_name_confidence=shirt_name_confidence,
                 identity_source=None,
+                uniform_color=extract_uniform_color(deps, frame, candidates[idx]),
+                overlap_iou=max_overlap,
             )
         )
     assign_players_to_detections(detections, player_refs, threshold, roster, use_reid)
@@ -1131,13 +1333,18 @@ def candidate_overlaps_other(
 ) -> bool:
     if threshold <= 0:
         return False
+    return candidate_max_overlap(candidates, index) >= threshold
+
+
+def candidate_max_overlap(
+    candidates: list[tuple[float, float, float, float, float]],
+    index: int,
+) -> float:
     bbox = candidates[index][:4]
-    for other_idx, other in enumerate(candidates):
-        if other_idx == index:
-            continue
-        if iou(bbox, other[:4]) >= threshold:
-            return True
-    return False
+    return max(
+        (iou(bbox, other[:4]) for other_idx, other in enumerate(candidates) if other_idx != index),
+        default=0.0,
+    )
 
 
 def assign_players_to_detections(
@@ -1316,6 +1523,62 @@ def xyxy_to_xywh(xyxy: Any) -> Any:
     return xywh
 
 
+def update_sportsmix_player_tracks(
+    tracker: SportsMixTracker,
+    player_tracks: list[PlayerTrack],
+    detections: list[PlayerDetection],
+    frame_idx: int,
+    ocr_relabel_min_confidence: float,
+) -> None:
+    outputs = tracker.update(detections, frame_idx)
+    active_ids = set()
+    for output in outputs:
+        source_detection = (
+            detections[output.source_index]
+            if output.source_index is not None and 0 <= output.source_index < len(detections)
+            else None
+        )
+        existing_track = find_player_track(player_tracks, output.track_id)
+        identity = choose_stable_track_identity(
+            source_detection,
+            existing_track,
+            frame_idx,
+            ocr_relabel_min_confidence,
+        )
+        if not output.observed and identity["player_id"]:
+            identity["identity_source"] = "tracker_prediction"
+        detection = PlayerDetection(
+            frame=frame_idx,
+            bbox=output.bbox,
+            confidence=output.confidence,
+            embedding=identity["embedding"],
+            player_id=identity["player_id"],
+            player_distance=identity["player_distance"],
+            jersey_number=identity["jersey_number"],
+            jersey_confidence=identity["jersey_confidence"],
+            shirt_name=identity["shirt_name"],
+            shirt_name_confidence=identity["shirt_name_confidence"],
+            identity_source=identity["identity_source"],
+            uniform_color=source_detection.uniform_color if source_detection is not None else None,
+            overlap_iou=source_detection.overlap_iou if source_detection is not None else 0.0,
+            observed=output.observed,
+            prediction_age=output.prediction_age,
+        )
+        if existing_track is None:
+            existing_track = PlayerTrack(track_id=output.track_id, detections=[detection])
+            player_tracks.append(existing_track)
+        elif not existing_track.detections or existing_track.detections[-1].frame != frame_idx:
+            existing_track.detections.append(detection)
+        else:
+            existing_track.detections[-1] = detection
+        existing_track.missed = 0 if output.observed else existing_track.missed + 1
+        active_ids.add(output.track_id)
+
+    for player_track in player_tracks:
+        if player_track.track_id not in active_ids:
+            player_track.missed += 1
+
+
 def update_bytetrack_player_tracks(
     tracker: Any,
     player_tracks: list[PlayerTrack],
@@ -1356,6 +1619,9 @@ def update_bytetrack_player_tracks(
             shirt_name=identity["shirt_name"],
             shirt_name_confidence=identity["shirt_name_confidence"],
             identity_source=identity["identity_source"],
+            uniform_color=source_detection.uniform_color if source_detection is not None else None,
+            overlap_iou=source_detection.overlap_iou if source_detection is not None else 0.0,
+            observed=source_detection is not None,
         )
         if existing_track is None:
             existing_track = PlayerTrack(track_id=track_id, detections=[detection], missed=0)
@@ -1371,7 +1637,9 @@ def update_bytetrack_player_tracks(
     for player_track in player_tracks:
         if player_track.track_id not in active_ids:
             player_track.missed += 1
-    player_tracks[:] = [track for track in player_tracks if track.missed <= max_missed]
+    # Keep completed tracklets for the offline team/identity pass. ByteTrack owns
+    # active/lost lifecycle; deleting the local history would discard future-to-
+    # past evidence as soon as a player left the active set.
 
 
 def update_deepsort_player_tracks(
@@ -1424,6 +1692,9 @@ def update_deepsort_player_tracks(
             shirt_name=identity["shirt_name"],
             shirt_name_confidence=identity["shirt_name_confidence"],
             identity_source=identity["identity_source"],
+            uniform_color=source_detection.uniform_color if isinstance(source_detection, PlayerDetection) else None,
+            overlap_iou=source_detection.overlap_iou if isinstance(source_detection, PlayerDetection) else 0.0,
+            observed=isinstance(source_detection, PlayerDetection),
         )
         if existing_track is None:
             existing_track = PlayerTrack(track_id=track.track_id, detections=[detection], missed=0)
@@ -1439,7 +1710,8 @@ def update_deepsort_player_tracks(
     for player_track in player_tracks:
         if player_track.track_id not in active_ids:
             player_track.missed += 1
-    player_tracks[:] = [track for track in player_tracks if track.missed <= max_missed]
+    # DeepSort owns active/lost lifecycle. Preserve local completed tracklets so
+    # the offline resolver can use evidence from the entire clip.
 
 
 def choose_stable_track_identity(
@@ -1597,6 +1869,11 @@ def predict_missing_roster_tracks(
             shirt_name=last.shirt_name or (player.names[0] if player and player.names else None),
             shirt_name_confidence=last.shirt_name_confidence,
             identity_source="predicted_track",
+            team=last.team,
+            team_confidence=last.team_confidence,
+            team_source=last.team_source,
+            observed=False,
+            prediction_age=max(1, frame_idx - last.frame),
         )
         track.detections.append(predicted)
 
@@ -2010,6 +2287,412 @@ def finalize_track_labels(tracks: list[PlayerTrack]) -> None:
             det.player_distance = avg_distance
 
 
+def split_tracklets_on_appearance_change(
+    tracks: list[PlayerTrack],
+    np: Any,
+    *,
+    threshold: float,
+    min_observations: int,
+) -> list[PlayerTrack]:
+    """Cut sustained appearance switches before assigning a tracklet identity.
+
+    Motion association can follow the wrong player during a long overlap. A
+    change point between two sufficiently long color histories is evidence that
+    the association is not one identity and must become separate tracklets.
+    """
+    minimum = max(2, int(min_observations))
+    output: list[PlayerTrack] = []
+    for track in tracks:
+        observed = [
+            detection
+            for detection in track.detections
+            if detection.observed
+            and detection.uniform_color is not None
+            and detection.overlap_iou < 0.50
+        ]
+        best_distance = 0.0
+        split_frame: int | None = None
+        if len(observed) >= minimum * 2:
+            for index in range(minimum, len(observed) - minimum + 1):
+                left = median_hsv([item.uniform_color for item in observed[:index]], np)
+                right = median_hsv([item.uniform_color for item in observed[index:]], np)
+                distance = hsv_distance(left, right)
+                if distance > best_distance:
+                    best_distance = distance
+                    split_frame = observed[index].frame
+
+        if split_frame is None or best_distance < threshold:
+            output.append(track)
+            continue
+        left_detections = [item for item in track.detections if item.frame < split_frame]
+        right_detections = [item for item in track.detections if item.frame >= split_frame]
+        if not left_detections or not right_detections:
+            output.append(track)
+            continue
+        output.append(
+            PlayerTrack(
+                track_id=f"{track.track_id}.a",
+                detections=left_detections,
+                hard_end_frame=split_frame - 1,
+            )
+        )
+        output.append(PlayerTrack(track_id=f"{track.track_id}.b", detections=right_detections))
+    return output
+
+
+def interpolate_internal_track_gaps(tracks: list[PlayerTrack], max_gap: int) -> None:
+    """Fill only bounded gaps; never hallucinate before or after a tracklet."""
+    if max_gap <= 0:
+        return
+    for track in tracks:
+        ordered = sorted(track.detections, key=lambda item: item.frame)
+        if len(ordered) < 2:
+            track.detections = ordered
+            continue
+        expanded: list[PlayerDetection] = []
+        for left, right in zip(ordered, ordered[1:]):
+            expanded.append(left)
+            missing = right.frame - left.frame - 1
+            if missing <= 0 or missing > max_gap:
+                continue
+            for offset in range(1, missing + 1):
+                ratio = offset / (missing + 1)
+                bbox = tuple(
+                    float(start + ratio * (end - start))
+                    for start, end in zip(left.bbox, right.bbox)
+                )
+                expanded.append(
+                    PlayerDetection(
+                        frame=left.frame + offset,
+                        bbox=bbox,  # type: ignore[arg-type]
+                        confidence=float(min(left.confidence, right.confidence) * 0.90),
+                        embedding=[],
+                        player_id=left.player_id if left.player_id == right.player_id else None,
+                        player_distance=left.player_distance if left.player_id == right.player_id else None,
+                        jersey_number=left.jersey_number if left.jersey_number == right.jersey_number else None,
+                        jersey_confidence=None,
+                        shirt_name=left.shirt_name if left.shirt_name == right.shirt_name else None,
+                        shirt_name_confidence=None,
+                        identity_source="track_interpolation",
+                        observed=False,
+                    )
+                )
+        expanded.append(ordered[-1])
+        track.detections = sorted(expanded, key=lambda item: item.frame)
+
+
+def classify_track_teams(
+    tracks: list[PlayerTrack],
+    near_polygon: list[tuple[float, float]],
+    near_color_samples: list[tuple[float, float, float]],
+    galleries: dict[str, list[list[float]]],
+    np: Any,
+    *,
+    color_threshold: float,
+    color_margin: float,
+    reid_threshold: float,
+    reid_margin: float,
+    reid_min_confidence: float,
+    dark_value_threshold: float,
+    dark_reid_confidence: float,
+) -> None:
+    """Classify a complete track after association, never before detection."""
+    near_color = median_hsv(near_color_samples, np) if near_color_samples else None
+    for track in tracks:
+        observed = [detection for detection in track.detections if detection.observed]
+        direct_ocr = [
+            detection
+            for detection in observed
+            if detection.player_id
+            and str(detection.identity_source or "").startswith("ocr_")
+            and ocr_identity_confidence(detection) >= 0.80
+        ]
+        if direct_ocr:
+            apply_team_to_track(track, "near", 0.98, "tracklet_roster_ocr")
+            continue
+
+        _reid_id, reid_distance, reid_separation = tracklet_reid_identity(track, galleries)
+        reid_confidence = tracklet_reid_confidence(reid_distance, reid_separation, reid_threshold)
+        colors = [
+            detection.uniform_color
+            for detection in observed
+            if detection.uniform_color is not None and detection.overlap_iou < 0.50
+        ]
+        track_color = median_hsv(colors, np) if colors else None
+        if (
+            track_color is not None
+            and track_color[2] < dark_value_threshold
+            and reid_confidence < dark_reid_confidence
+        ):
+            confidence = min(0.96, max(0.55, 1.0 - track_color[2] / max(dark_value_threshold, 1.0)))
+            apply_team_to_track(track, "opponent", confidence, "tracklet_dark_uniform")
+            clear_track_identity(track, "opponent_team")
+            continue
+        if (
+            reid_distance is not None
+            and reid_distance <= reid_threshold
+            and reid_separation >= reid_margin
+            and reid_confidence >= reid_min_confidence
+        ):
+            apply_team_to_track(track, "near", reid_confidence, "tracklet_roster_reid")
+            continue
+
+        color_distances = [hsv_distance(color, near_color) for color in colors if near_color is not None]
+        color_score = robust_lower_median(color_distances)
+        intersection_ratio = (
+            sum(
+                candidate_intersects_polygon((*detection.bbox, detection.confidence), near_polygon)
+                for detection in observed
+            )
+            / len(observed)
+            if observed
+            else 0.0
+        )
+
+        if color_score is not None and color_score <= color_threshold:
+            confidence = max(0.55, min(0.96, 1.0 - color_score / max(1.0, color_threshold + color_margin)))
+            apply_team_to_track(track, "near", confidence, "tracklet_uniform_color")
+        elif color_score is not None and color_score >= color_threshold + color_margin:
+            confidence = max(0.55, min(0.96, (color_score - color_threshold) / max(color_margin, 1.0)))
+            apply_team_to_track(track, "opponent", confidence, "tracklet_uniform_color")
+            clear_track_identity(track, "opponent_team")
+        elif color_score is None and intersection_ratio >= 0.75:
+            apply_team_to_track(track, "near", 0.55, "tracklet_court_geometry")
+        elif color_score is None and intersection_ratio <= 0.20:
+            apply_team_to_track(track, "opponent", 0.55, "tracklet_court_geometry")
+            clear_track_identity(track, "opponent_team")
+        else:
+            apply_team_to_track(track, "unknown", 0.0, "tracklet_ambiguous")
+
+
+def apply_legacy_track_teams(tracks: list[PlayerTrack], near_polygon: list[tuple[float, float]]) -> None:
+    """Attach team metadata to legacy experiments without changing their labels."""
+    for track in tracks:
+        observed = [detection for detection in track.detections if detection.observed]
+        has_label = any(detection.player_id for detection in observed)
+        court_ratio = (
+            sum(
+                candidate_intersects_polygon((*detection.bbox, detection.confidence), near_polygon)
+                for detection in observed
+            )
+            / len(observed)
+            if observed
+            else 0.0
+        )
+        team = "near" if has_label or court_ratio >= 0.50 else "unknown"
+        apply_team_to_track(track, team, 0.5 if team == "near" else 0.0, "legacy")
+
+
+def apply_team_to_track(track: PlayerTrack, team: str, confidence: float, source: str) -> None:
+    track.team = team
+    track.team_confidence = float(confidence)
+    track.team_source = source
+    for detection in track.detections:
+        detection.team = team
+        detection.team_confidence = float(confidence)
+        detection.team_source = source
+
+
+def robust_lower_median(values: list[float]) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(float(value) for value in values)
+    keep = ordered[: max(1, (len(ordered) + 1) // 2)]
+    middle = len(keep) // 2
+    if len(keep) % 2:
+        return keep[middle]
+    return (keep[middle - 1] + keep[middle]) / 2.0
+
+
+def resolve_tracklet_identities(
+    tracks: list[PlayerTrack],
+    roster: PlayerRoster | None,
+    galleries: dict[str, list[list[float]]],
+    *,
+    reid_threshold: float,
+    reid_margin: float,
+    reid_min_confidence: float,
+    ocr_min_confidence: float,
+) -> None:
+    """Resolve one identity per complete tracklet and copy it to all its frames."""
+    for track in tracks:
+        if track.team == "opponent":
+            clear_track_identity(track, "opponent_team")
+            continue
+
+        player_id, confidence = tracklet_ocr_identity(track, ocr_min_confidence)
+        source = "tracklet_ocr_future" if player_id else None
+        distance: float | None = None
+        if player_id is None:
+            player_id, distance, margin = tracklet_reid_identity(track, galleries)
+            strong_single = distance is not None and distance <= reid_threshold * 0.75 and margin >= reid_margin * 1.5
+            enough_evidence = count_clean_track_embeddings(track) >= 2 or strong_single
+            if (
+                player_id is None
+                or distance is None
+                or distance > reid_threshold
+                or margin < reid_margin
+                or not enough_evidence
+            ):
+                player_id = None
+            else:
+                confidence = tracklet_reid_confidence(distance, margin, reid_threshold)
+                if confidence < reid_min_confidence:
+                    player_id = None
+                source = "tracklet_reid_future"
+
+        if player_id is None:
+            clear_track_identity(track, "tracklet_unknown")
+            continue
+
+        # A confident match to this video's roster is also positive team evidence.
+        if track.team == "unknown":
+            apply_team_to_track(track, "near", max(0.55, confidence), "tracklet_identity")
+        player = roster.player_by_id(player_id) if roster is not None else None
+        track.resolved_player_id = player_id
+        track.identity_confidence = float(confidence)
+        track.identity_source = source
+        for detection in track.detections:
+            detection.player_id = player_id
+            detection.player_distance = distance
+            detection.identity_source = source
+            if player is not None:
+                detection.jersey_number = player.jersey_number
+                detection.jersey_confidence = confidence if player.jersey_number else None
+                detection.shirt_name = player.names[0] if player.names else None
+                detection.shirt_name_confidence = confidence if player.names else None
+
+
+def tracklet_ocr_identity(track: PlayerTrack, minimum_confidence: float) -> tuple[str | None, float]:
+    votes: dict[str, list[float]] = {}
+    for detection in track.detections:
+        if not detection.observed or not detection.player_id:
+            continue
+        if not str(detection.identity_source or "").startswith("ocr_"):
+            continue
+        confidence = ocr_identity_confidence(detection)
+        if confidence >= minimum_confidence:
+            votes.setdefault(detection.player_id, []).append(confidence)
+    if not votes:
+        return None, 0.0
+    ranked = sorted(
+        ((sum(values), max(values), player_id) for player_id, values in votes.items()),
+        reverse=True,
+    )
+    best_total, best_confidence, best_id = ranked[0]
+    second_total = ranked[1][0] if len(ranked) > 1 else 0.0
+    if best_total - second_total < 0.10:
+        return None, 0.0
+    return best_id, float(best_confidence)
+
+
+def count_clean_track_embeddings(track: PlayerTrack) -> int:
+    return sum(
+        bool(detection.embedding) and detection.observed and detection.overlap_iou < 0.50
+        for detection in track.detections
+    )
+
+
+def tracklet_reid_identity(
+    track: PlayerTrack,
+    galleries: dict[str, list[list[float]]],
+) -> tuple[str | None, float | None, float]:
+    embeddings = [
+        detection.embedding
+        for detection in track.detections
+        if detection.observed and detection.embedding and detection.overlap_iou < 0.50
+    ]
+    if not embeddings or not galleries:
+        return None, None, 0.0
+    scored: list[tuple[float, str]] = []
+    for player_id, gallery in galleries.items():
+        if not gallery:
+            continue
+        per_detection = [min(euclidean(embedding, reference) for reference in gallery) for embedding in embeddings]
+        score = robust_lower_median(per_detection)
+        if score is not None:
+            scored.append((score, player_id))
+    if not scored:
+        return None, None, 0.0
+    scored.sort()
+    best_distance, best_id = scored[0]
+    second_distance = scored[1][0] if len(scored) > 1 else best_distance + 1.0
+    return best_id, float(best_distance), float(second_distance - best_distance)
+
+
+def tracklet_reid_confidence(distance: float | None, margin: float, threshold: float) -> float:
+    if distance is None:
+        return 0.0
+    return max(
+        0.0,
+        min(0.99, 0.5 * (1.0 - distance / max(threshold, 1e-6)) + 0.5 * margin),
+    )
+
+
+def clear_track_identity(track: PlayerTrack, source: str) -> None:
+    track.resolved_player_id = None
+    track.identity_confidence = 0.0
+    track.identity_source = source
+    for detection in track.detections:
+        detection.player_id = None
+        detection.player_distance = None
+        detection.jersey_number = None
+        detection.jersey_confidence = None
+        detection.shirt_name = None
+        detection.shirt_name_confidence = None
+        detection.identity_source = source
+
+
+def render_annotated_video(
+    *,
+    deps: dict[str, Any],
+    video_path: Path,
+    output_path: Path,
+    fps: float,
+    width: int,
+    height: int,
+    max_frames: int,
+    near_polygon: list[tuple[float, float]],
+    tracks: list[PlayerTrack],
+    ball_track: list[BallObservation],
+    team_filter: str,
+    trail_length: int,
+    player_draw_max_gap: int,
+) -> None:
+    cv2 = deps["cv2"]
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise SystemExit(f"Could not reopen video for rendering: {video_path}")
+    writer = cv2.VideoWriter(
+        str(output_path),
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        fps,
+        (width, height),
+    )
+    ball_by_frame = {point.frame: point for point in ball_track}
+    frame_idx = 0
+    while frame_idx < max_frames:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        annotated = draw_debug_frame(
+            deps=deps,
+            frame=frame,
+            near_polygon=near_polygon,
+            tracks=tracks,
+            current_frame=frame_idx,
+            ball=ball_by_frame.get(frame_idx),
+            ball_track=ball_track,
+            team_filter=team_filter,
+            trail_length=trail_length,
+            player_draw_max_gap=player_draw_max_gap,
+        )
+        writer.write(annotated)
+        frame_idx += 1
+    cap.release()
+    writer.release()
+
+
 def draw_debug_frame(
     deps: dict[str, Any],
     frame: Any,
@@ -2033,24 +2716,43 @@ def draw_debug_frame(
         det = latest_detection_near_frame(track, current_frame, max_gap=player_draw_max_gap)
         if not det:
             continue
+        frame_height, frame_width = frame.shape[:2]
+        cx, cy = bbox_center(det.bbox)
+        if not (0 <= cx < frame_width and 0 <= cy < frame_height):
+            continue
         visible_detections.append((track, det))
 
     unique_player_detection_ids = nearest_visible_detection_ids_by_player(visible_detections)
     for track, det in visible_detections:
         x1, y1, x2, y2 = [int(v) for v in det.bbox]
-        use_player_label = det.player_id is not None and id(det) in unique_player_detection_ids
-        label = det.player_id if use_player_label else f"track_{track.track_id}"
-        if use_player_label and det.identity_source == "ocr_name":
+        use_player_label = (
+            det.team == "near"
+            and det.player_id is not None
+            and id(det) in unique_player_detection_ids
+        )
+        if det.team == "opponent":
+            label = f"opponent track_{track.track_id}"
+            color = (0, 0, 255)
+            text_color = (0, 0, 180)
+        elif det.team == "near":
+            label = det.player_id if use_player_label else f"unknown track_{track.track_id}"
+            color = (255, 160, 0)
+            text_color = (20, 70, 180)
+        else:
+            label = f"unknown track_{track.track_id}"
+            color = (0, 215, 255)
+            text_color = (20, 110, 170)
+        if use_player_label and det.shirt_name:
             label = f"{label} {det.shirt_name}"
-        elif use_player_label and det.identity_source == "ocr_number":
+        elif use_player_label and det.jersey_number:
             label = f"{label} #{det.jersey_number}"
         if use_player_label:
-            ocr_confidence = display_ocr_confidence(det)
-            if ocr_confidence is not None:
-                label = f"{label} ocr={ocr_confidence:.2f}"
-        cv2.rectangle(out, (x1, y1), (x2, y2), (255, 160, 0), 3)
+            confidence = track.identity_confidence or display_ocr_confidence(det)
+            if confidence is not None:
+                label = f"{label} id={confidence:.2f}"
+        cv2.rectangle(out, (x1, y1), (x2, y2), color, 3)
         cv2.putText(out, label, (x1, max(24, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 3)
-        cv2.putText(out, label, (x1, max(24, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (20, 70, 180), 2)
+        cv2.putText(out, label, (x1, max(24, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, text_color, 2)
     if ball:
         recent = [point for point in ball_track[-trail_length:] if current_frame - point.frame <= trail_length]
         for idx in range(1, len(recent)):
@@ -2100,7 +2802,7 @@ def nearest_visible_detection_ids_by_player(
 ) -> set[int]:
     best_by_player: dict[str, PlayerDetection] = {}
     for _, detection in visible_detections:
-        if detection.player_id is None:
+        if detection.team != "near" or detection.player_id is None:
             continue
         current_best = best_by_player.get(detection.player_id)
         if current_best is None or visible_detection_rank(detection) < visible_detection_rank(current_best):
@@ -2131,9 +2833,18 @@ def latest_detection_near_frame(
 ) -> PlayerDetection | None:
     if not track.detections:
         return None
-    det = track.detections[-1]
-    if abs(frame - det.frame) <= max_gap:
-        return det
+    if track.hard_end_frame is not None and frame > track.hard_end_frame:
+        return None
+    # This is called after the full clip has been processed, so the last list
+    # item is usually in the future. Choose the latest observation at or before
+    # the requested frame.
+    for det in reversed(track.detections):
+        if det.frame <= frame:
+            if not det.observed and det.prediction_age > max_gap:
+                return None
+            if frame - det.frame <= max_gap:
+                return det
+            return None
     return None
 
 
@@ -2201,6 +2912,13 @@ def serialize_tracks(tracks: list[PlayerTrack]) -> list[dict[str, Any]]:
     return [
         {
             "track_id": track.track_id,
+            "team": track.team,
+            "team_confidence": track.team_confidence,
+            "team_source": track.team_source,
+            "resolved_player_id": track.resolved_player_id,
+            "identity_confidence": track.identity_confidence,
+            "identity_source": track.identity_source,
+            "hard_end_frame": track.hard_end_frame,
             "detections": [
                 {
                     "frame": det.frame,
@@ -2218,6 +2936,13 @@ def serialize_tracks(tracks: list[PlayerTrack]) -> list[dict[str, Any]]:
                     "shirt_name": det.shirt_name,
                     "shirt_name_confidence": det.shirt_name_confidence,
                     "identity_source": det.identity_source,
+                    "team": det.team,
+                    "team_confidence": det.team_confidence,
+                    "team_source": det.team_source,
+                    "uniform_color_hsv": list(det.uniform_color) if det.uniform_color is not None else None,
+                    "overlap_iou": det.overlap_iou,
+                    "observed": det.observed,
+                    "prediction_age": det.prediction_age,
                 }
                 for det in track.detections
             ],
@@ -2241,11 +2966,20 @@ def serialize_visible_player_detections(
 
     unique_player_detection_ids = nearest_visible_detection_ids_by_player(visible_detections)
     for track, det in visible_detections:
-        use_player_label = det.player_id is not None and id(det) in unique_player_detection_ids
-        display_label = det.player_id if use_player_label else f"track_{track.track_id}"
-        if use_player_label and det.identity_source == "ocr_name":
+        use_player_label = (
+            det.team == "near"
+            and det.player_id is not None
+            and id(det) in unique_player_detection_ids
+        )
+        if det.team == "opponent":
+            display_label = f"opponent track_{track.track_id}"
+        elif use_player_label:
+            display_label = det.player_id
+        else:
+            display_label = f"unknown track_{track.track_id}"
+        if use_player_label and det.shirt_name:
             display_label = f"{display_label} {det.shirt_name}"
-        elif use_player_label and det.identity_source == "ocr_number":
+        elif use_player_label and det.jersey_number:
             display_label = f"{display_label} #{det.jersey_number}"
         if use_player_label:
             ocr_confidence = display_ocr_confidence(det)
@@ -2273,6 +3007,13 @@ def serialize_visible_player_detections(
                 "shirt_name": det.shirt_name,
                 "shirt_name_confidence": det.shirt_name_confidence,
                 "identity_source": det.identity_source,
+                "identity_confidence": track.identity_confidence,
+                "team": det.team,
+                "team_confidence": det.team_confidence,
+                "team_source": det.team_source,
+                "observed": det.observed,
+                "prediction_age": det.prediction_age,
+                "overlap_iou": det.overlap_iou,
             }
         )
     return {"frame": frame, "detections": visible}
@@ -2304,6 +3045,12 @@ def write_csv(
         "shirt_name",
         "shirt_name_confidence",
         "identity_source",
+        "team",
+        "team_confidence",
+        "team_source",
+        "observed",
+        "prediction_age",
+        "overlap_iou",
     ]
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -2330,6 +3077,12 @@ def write_csv(
                     "shirt_name": "",
                     "shirt_name_confidence": "",
                     "identity_source": "",
+                    "team": "",
+                    "team_confidence": "",
+                    "team_source": "",
+                    "observed": "",
+                    "prediction_age": "",
+                    "overlap_iou": "",
                 }
             )
         for track in tracks:
@@ -2348,13 +3101,19 @@ def write_csv(
                         "ball_x": "",
                         "ball_y": "",
                         "confidence": round(det.confidence, 6),
-                        "source": "yolo_person",
+                        "source": "yolo_person" if det.observed else det.identity_source or "track_prediction",
                         "player_distance": "" if det.player_distance is None else round(det.player_distance, 6),
                         "jersey_number": det.jersey_number or "",
                         "jersey_confidence": "" if det.jersey_confidence is None else round(det.jersey_confidence, 6),
                         "shirt_name": det.shirt_name or "",
                         "shirt_name_confidence": "" if det.shirt_name_confidence is None else round(det.shirt_name_confidence, 6),
                         "identity_source": det.identity_source or "",
+                        "team": det.team,
+                        "team_confidence": round(det.team_confidence, 6),
+                        "team_source": det.team_source or "",
+                        "observed": det.observed,
+                        "prediction_age": det.prediction_age,
+                        "overlap_iou": round(det.overlap_iou, 6),
                     }
                 )
 
