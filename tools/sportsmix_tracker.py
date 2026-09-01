@@ -87,7 +87,7 @@ class SportsMixTracker:
         unmatched_states = set(range(len(active)))
         unmatched_detections = set(range(len(detections)))
         if cost.size:
-            rows, cols = linear_sum_assignment(cost)
+            rows, cols = _linear_sum_assignment_with_forbidden_edges(cost)
             for row, col in zip(rows.tolist(), cols.tolist()):
                 if not np.isfinite(cost[row, col]) or cost[row, col] > self.match_threshold:
                     continue
@@ -257,6 +257,24 @@ def embedding_distance(current: np.ndarray | None, observed: Any) -> float:
     if current is None or vector is None or current.shape != vector.shape:
         return 1.0
     return float(np.linalg.norm(current - vector))
+
+
+def _linear_sum_assignment_with_forbidden_edges(cost: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Run Hungarian assignment when motion gates have forbidden whole rows/columns.
+
+    SciPy raises ``ValueError: cost matrix is infeasible`` when a rectangular
+    assignment contains no finite edge for a required row or column.  SportsMix
+    deliberately represents motion-gated pairs as infinity, and such isolated
+    tracks/detections are normal after cuts, detector flicker, or rapid camera
+    motion.  Give forbidden edges a finite sentinel for the optimization, then
+    let the caller reject those pairs using the original matrix.
+    """
+
+    finite = cost[np.isfinite(cost)]
+    largest_finite = float(np.max(finite)) if finite.size else 0.0
+    forbidden_cost = max(1_000_000.0, largest_finite + 1_000.0)
+    assignment_cost = np.where(np.isfinite(cost), cost, forbidden_cost)
+    return linear_sum_assignment(assignment_cost)
 
 
 def _normalized_embedding(value: Any) -> np.ndarray | None:

@@ -2520,26 +2520,52 @@ def resolve_tracklet_identities(
             clear_track_identity(track, "opponent_team")
             continue
 
-        player_id, confidence = tracklet_ocr_identity(track, ocr_min_confidence)
-        source = "tracklet_ocr_future" if player_id else None
-        distance: float | None = None
-        if player_id is None:
-            player_id, distance, margin = tracklet_reid_identity(track, galleries)
-            strong_single = distance is not None and distance <= reid_threshold * 0.75 and margin >= reid_margin * 1.5
-            enough_evidence = count_clean_track_embeddings(track) >= 2 or strong_single
-            if (
-                player_id is None
-                or distance is None
-                or distance > reid_threshold
-                or margin < reid_margin
-                or not enough_evidence
-            ):
-                player_id = None
-            else:
-                confidence = tracklet_reid_confidence(distance, margin, reid_threshold)
-                if confidence < reid_min_confidence:
-                    player_id = None
-                source = "tracklet_reid_future"
+        ocr_player_id, ocr_confidence = tracklet_ocr_identity(track, ocr_min_confidence)
+        reid_player_id, reid_distance, reid_margin_value = tracklet_reid_identity(track, galleries)
+        strong_single = (
+            reid_distance is not None
+            and reid_distance <= reid_threshold * 0.75
+            and reid_margin_value >= reid_margin * 1.5
+        )
+        enough_reid_evidence = count_clean_track_embeddings(track) >= 2 or strong_single
+        reid_confidence = tracklet_reid_confidence(reid_distance, reid_margin_value, reid_threshold)
+        valid_reid = (
+            reid_player_id is not None
+            and reid_distance is not None
+            and reid_distance <= reid_threshold
+            and reid_margin_value >= reid_margin
+            and enough_reid_evidence
+            and reid_confidence >= reid_min_confidence
+        )
+
+        # Identities intentionally omitted from the numbered roster are
+        # embedding-only players. A confident whole-track gallery match for
+        # them must beat incidental OCR text seen on a crop.
+        embedding_only_reid = (
+            valid_reid
+            and roster is not None
+            and roster.player_by_id(reid_player_id) is None
+        )
+        if embedding_only_reid:
+            player_id = reid_player_id
+            confidence = reid_confidence
+            distance = reid_distance
+            source = "tracklet_reid_embedding_only_future"
+        elif ocr_player_id is not None:
+            player_id = ocr_player_id
+            confidence = ocr_confidence
+            distance = None
+            source = "tracklet_ocr_future"
+        elif valid_reid:
+            player_id = reid_player_id
+            confidence = reid_confidence
+            distance = reid_distance
+            source = "tracklet_reid_future"
+        else:
+            player_id = None
+            confidence = 0.0
+            distance = None
+            source = None
 
         if player_id is None:
             clear_track_identity(track, "tracklet_unknown")
@@ -2561,6 +2587,11 @@ def resolve_tracklet_identities(
                 detection.jersey_confidence = confidence if player.jersey_number else None
                 detection.shirt_name = player.names[0] if player.names else None
                 detection.shirt_name_confidence = confidence if player.names else None
+            elif source == "tracklet_reid_embedding_only_future":
+                detection.jersey_number = None
+                detection.jersey_confidence = None
+                detection.shirt_name = None
+                detection.shirt_name_confidence = None
 
 
 def tracklet_ocr_identity(track: PlayerTrack, minimum_confidence: float) -> tuple[str | None, float]:

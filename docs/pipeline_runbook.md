@@ -291,7 +291,7 @@ This creates the final annotated rally video. It uses the cleaned ball track, th
   --ball-reset-gap-sec 0.17 \
   --serve-window-sec 0.47 \
   --reception-window-sec 0.13 \
-  --reception-min-gap-sec 0.17 \
+  --reception-min-gap-sec 0 \
   --action-min-gap-sec 0.40 \
   --serve-min-speed 8 \
   --serve-min-distance 120 \
@@ -337,7 +337,7 @@ Reproduce the scoring after running experiments:
 - Temporal thresholds use seconds and are converted to frame counts from each video's measured FPS. This keeps equivalent behavior at 30, 60, and 120 FPS.
 - `--ball-reset-gap-sec 0.17` resets ball state after approximately 0.17 seconds of missing or rejected detections, allowing reacquisition.
 - `--max-ball-gap-sec 0` disables filling missing ball time with predicted ball points.
-- `--reception-min-gap-sec 0.17` ignores trajectory changes immediately after the detected serve window. The default is about 5 frames at 30 FPS, 10 at 60 FPS, and 20 at 120 FPS.
+- `--reception-min-gap-sec 0` starts checking reception candidates immediately after the detected serve window. This avoids dropping a real contact that falls exactly on the old minimum-gap boundary.
 - The old frame options such as `--ball-reset-gap`, `--max-ball-gap`, `--serve-window`, and `--reception-min-frame-gap` remain as deprecated explicit overrides for older commands.
 - `--track-all-players` deliberately postpones team classification until after tracking.
 - `--tracker sportsmix` fuses motion/IoU with OSNet appearance and freezes appearance-template updates during overlap.

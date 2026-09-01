@@ -1,6 +1,7 @@
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -66,6 +67,45 @@ class TrackletPlayerResolutionTests(unittest.TestCase):
         )
         self.assertIsNone(track.resolved_player_id)
         self.assertIsNone(track.detections[0].player_id)
+
+    def test_embedding_only_identity_overrides_incidental_roster_ocr(self) -> None:
+        roster_player = SimpleNamespace(
+            player_id="jersey_9",
+            jersey_number="9",
+            names=[],
+        )
+        roster = SimpleNamespace(
+            player_by_id=lambda player_id: roster_player if player_id == "jersey_9" else None,
+        )
+        track = PlayerTrack(
+            track_id=1,
+            team="near",
+            detections=[
+                detection(
+                    0,
+                    player_id="jersey_9",
+                    source="ocr_number",
+                    jersey_confidence=0.99,
+                    embedding=[0, 1],
+                ),
+                detection(1, embedding=[0, 1]),
+            ],
+        )
+
+        resolve_tracklet_identities(
+            [track],
+            roster,
+            {"jersey_9": [[1, 0]], "jersey_vlad": [[0, 1]]},
+            reid_threshold=0.9,
+            reid_margin=0.1,
+            reid_min_confidence=0.1,
+            ocr_min_confidence=0.85,
+        )
+
+        self.assertEqual(track.resolved_player_id, "jersey_vlad")
+        self.assertEqual(track.identity_source, "tracklet_reid_embedding_only_future")
+        self.assertEqual({item.player_id for item in track.detections}, {"jersey_vlad"})
+        self.assertTrue(all(item.jersey_number is None for item in track.detections))
 
     def test_opponent_track_cannot_keep_roster_identity(self) -> None:
         track = PlayerTrack(

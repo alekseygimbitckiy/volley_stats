@@ -60,6 +60,32 @@ class SportsMixTrackerTests(unittest.TestCase):
         self.assertFalse(two[0].observed)
         self.assertEqual(three, [])
 
+    def test_all_motion_gated_pairs_become_unmatched_instead_of_crashing(self) -> None:
+        tracker = SportsMixTracker(max_age=2, max_center_distance=0.5)
+        tracker.update([Detection((0, 0, 20, 40), [1, 0])], 0)
+
+        outputs = tracker.update([Detection((1000, 0, 1020, 40), [1, 0])], 1)
+
+        self.assertEqual(len(outputs), 2)
+        predicted = next(item for item in outputs if item.track_id == 1)
+        new_track = next(item for item in outputs if item.track_id == 2)
+        self.assertFalse(predicted.observed)
+        self.assertTrue(new_track.observed)
+        self.assertEqual(new_track.source_index, 0)
+
+    def test_infeasible_row_does_not_block_a_valid_match(self) -> None:
+        tracker = SportsMixTracker(max_age=2, max_center_distance=0.75)
+        tracker.update(
+            [Detection((0, 0, 20, 40), [1, 0]), Detection((1000, 0, 1020, 40), [0, 1])],
+            0,
+        )
+
+        outputs = tracker.update([Detection((2, 0, 22, 40), [1, 0])], 1)
+
+        observed = [item for item in outputs if item.observed]
+        self.assertEqual([(item.track_id, item.source_index) for item in observed], [(1, 0)])
+        self.assertFalse(next(item for item in outputs if item.track_id == 2).observed)
+
 
 if __name__ == "__main__":
     unittest.main()
