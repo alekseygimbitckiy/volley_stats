@@ -72,6 +72,7 @@ class BallObservation:
     radius: float
     confidence: float
     source: str
+    tracklet_id: int | None = None
 
 
 @dataclass
@@ -93,6 +94,7 @@ class BallState:
             radius=self.last.radius,
             confidence=max(0.05, self.last.confidence * (0.72 ** dt)),
             source="predicted",
+            tracklet_id=self.last.tracklet_id,
         )
 
     def update(self, observation: BallObservation) -> None:
@@ -315,6 +317,13 @@ def main() -> int:
     parser.add_argument("--player-draw-max-gap", dest="player_draw_max_gap_frames", type=int, default=None, help="Deprecated frame override for --player-draw-max-gap-sec.")
     parser.add_argument("--max-ball-gap-sec", type=float, default=18 / 30, help="Seconds of missing ball detections to fill with predicted points.")
     parser.add_argument("--max-ball-gap", dest="max_ball_gap_frames", type=int, default=None, help="Deprecated frame override for --max-ball-gap-sec.")
+    parser.add_argument(
+        "--post-serve-max-ball-gap-sec",
+        type=float,
+        default=6 / 30,
+        help="Prediction duration used after a credible serve/rally flight is established, even when --max-ball-gap-sec is zero.",
+    )
+    parser.add_argument("--post-serve-max-ball-gap", dest="post_serve_max_ball_gap_frames", type=int, default=None, help="Deprecated frame override for --post-serve-max-ball-gap-sec.")
     parser.add_argument("--ball-max-jump", type=float, default=95.0, help="Reject ball detections farther than this many pixels from the predicted ball position in one frame.")
     parser.add_argument(
         "--ball-reacquire-gap-sec",
@@ -336,6 +345,43 @@ def main() -> int:
         help="After this many rejected/missing-ball seconds, reset ball state so tracking can restart anywhere.",
     )
     parser.add_argument("--ball-reset-gap", dest="ball_reset_gap_frames", type=int, default=None, help="Deprecated frame override for --ball-reset-gap-sec.")
+    parser.add_argument(
+        "--offline-ball-tracklet-filter",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Split the accepted ball track at reacquisitions, score complete tracklets, and remove weak disconnected segments.",
+    )
+    parser.add_argument(
+        "--ball-tracklet-split-gap-sec",
+        type=float,
+        default=5 / 30,
+        help="Missing-ball duration that starts a new offline ball tracklet.",
+    )
+    parser.add_argument("--ball-tracklet-split-gap", dest="ball_tracklet_split_gap_frames", type=int, default=None, help="Deprecated frame override for --ball-tracklet-split-gap-sec.")
+    parser.add_argument(
+        "--ball-tracklet-min-duration-sec",
+        type=float,
+        default=6 / 30,
+        help="Minimum duration for an independently credible ball tracklet.",
+    )
+    parser.add_argument("--ball-tracklet-min-duration", dest="ball_tracklet_min_duration_frames", type=int, default=None, help="Deprecated frame override for --ball-tracklet-min-duration-sec.")
+    parser.add_argument("--ball-tracklet-min-points", type=int, default=8)
+    parser.add_argument("--ball-tracklet-min-distance", type=float, default=20.0)
+    parser.add_argument(
+        "--ball-tracklet-max-link-speed",
+        type=float,
+        default=60.0,
+        help="Maximum px/frame speed for treating two disconnected tracklets as a plausible continuation.",
+    )
+    parser.add_argument("--ball-tracklet-max-speed", type=float, default=90.0)
+    parser.add_argument("--ball-tracklet-max-acceleration", type=float, default=55.0)
+    parser.add_argument("--ball-tracklet-max-mean-angle-change", type=float, default=90.0)
+    parser.add_argument("--ball-tracklet-min-score", type=float, default=0.55)
+    parser.add_argument("--ball-tracklet-serve-search-ratio", type=float, default=0.55)
+    parser.add_argument("--ball-tracklet-serve-min-distance", type=float, default=80.0)
+    parser.add_argument("--ball-tracklet-serve-min-speed", type=float, default=4.0)
+    parser.add_argument("--ball-tracklet-toss-min-height", type=float, default=40.0)
+    parser.add_argument("--ball-tracklet-toss-max-x-drift", type=float, default=80.0)
     parser.add_argument(
         "--ball-source",
         choices=["auto", "vball-net", "yolo", "motion"],
@@ -434,6 +480,8 @@ def main() -> int:
     visible_player_detections: list[dict[str, Any]] = []
     last_player_detections: list[PlayerDetection] = []
     ball_state = BallState()
+    credible_ball_flight_started = False
+    credible_ball_flight_start_frame: int | None = None
     next_track_id = 1
     frame_idx = -1
 
@@ -576,7 +624,7 @@ def main() -> int:
             candidates=ball_candidates,
             state=ball_state,
             frame_idx=frame_idx,
-            max_gap=args.max_ball_gap,
+            max_gap=(args.post_serve_max_ball_gap if credible_ball_flight_started else args.max_ball_gap),
             max_jump=args.ball_max_jump,
             reacquire_gap=args.ball_reacquire_gap,
             reacquire_max_jump=args.ball_reacquire_max_jump,
@@ -584,11 +632,59 @@ def main() -> int:
         )
         if ball:
             ball_track.append(ball)
+            if not credible_ball_flight_started and has_credible_ball_flight(
+                ball_track,
+                min_points=args.ball_tracklet_min_points,
+                min_duration_frames=args.ball_tracklet_min_duration,
+                min_distance=args.ball_tracklet_serve_min_distance,
+                min_speed=args.ball_tracklet_serve_min_speed,
+                max_internal_gap=args.ball_tracklet_split_gap,
+            ):
+                credible_ball_flight_started = True
+                credible_ball_flight_start_frame = ball_track[-args.ball_tracklet_min_points].frame
+                print(
+                    f"  credible ball flight established at frame {frame_idx}; "
+                    f"protecting up to {args.post_serve_max_ball_gap} predicted frames per occlusion"
+                )
 
         if frame_idx % 100 == 0:
             print(f"  frame {frame_idx}: tracks={len(player_tracks)} ball_points={len(ball_track)}")
 
     cap.release()
+
+    ball_tracklet_filter = {"enabled": False}
+    if args.offline_ball_tracklet_filter:
+        ball_track, ball_tracklet_filter = filter_offline_ball_tracklets(
+            ball_track,
+            frame_count=frame_idx + 1,
+            split_gap_frames=args.ball_tracklet_split_gap,
+            min_duration_frames=args.ball_tracklet_min_duration,
+            min_points=args.ball_tracklet_min_points,
+            min_distance=args.ball_tracklet_min_distance,
+            max_link_speed=args.ball_tracklet_max_link_speed,
+            max_speed=args.ball_tracklet_max_speed,
+            max_acceleration=args.ball_tracklet_max_acceleration,
+            max_mean_angle_change=args.ball_tracklet_max_mean_angle_change,
+            min_score=args.ball_tracklet_min_score,
+            serve_search_ratio=args.ball_tracklet_serve_search_ratio,
+            serve_min_distance=args.ball_tracklet_serve_min_distance,
+            serve_min_speed=args.ball_tracklet_serve_min_speed,
+            toss_min_height=args.ball_tracklet_toss_min_height,
+            toss_max_x_drift=args.ball_tracklet_toss_max_x_drift,
+        )
+        print(
+            f"Offline ball tracklets: kept={ball_tracklet_filter['kept_tracklets']}/"
+            f"{ball_tracklet_filter['total_tracklets']} points={ball_tracklet_filter['input_points']}"
+            f"->{ball_tracklet_filter['output_points']}"
+        )
+        for tracklet in ball_tracklet_filter["tracklets"]:
+            decision = "kept" if tracklet["kept"] else "removed"
+            print(
+                f"  ball tracklet {tracklet['tracklet_id']}: frames={tracklet['start_frame']}-"
+                f"{tracklet['end_frame']} points={tracklet['point_count']} "
+                f"distance={tracklet['distance_px']:.1f} score={tracklet['score']:.3f} "
+                f"{decision} reason={tracklet['decision_reason']}"
+            )
 
     if players_enabled:
         if args.split_tracklets_on_appearance_change:
@@ -675,6 +771,13 @@ def main() -> int:
                 else None
             ),
         },
+        "ball_tracklet_filter": ball_tracklet_filter,
+        "post_serve_prediction": {
+            "enabled": args.post_serve_max_ball_gap > 0,
+            "credible_flight_established": credible_ball_flight_started,
+            "credible_flight_start_frame": credible_ball_flight_start_frame,
+            "max_gap_frames": args.post_serve_max_ball_gap,
+        },
         "ball_track": [ball.__dict__ for ball in ball_track],
         "player_tracks": serialize_tracks(player_tracks),
         "visible_player_detections": visible_player_detections,
@@ -722,6 +825,14 @@ def resolve_temporal_parameters(args: argparse.Namespace, fps: float) -> dict[st
         ),
         ("max_ball_gap", "max_ball_gap_sec", "max_ball_gap_frames", "--max-ball-gap-sec", "--max-ball-gap", 0),
         (
+            "post_serve_max_ball_gap",
+            "post_serve_max_ball_gap_sec",
+            "post_serve_max_ball_gap_frames",
+            "--post-serve-max-ball-gap-sec",
+            "--post-serve-max-ball-gap",
+            0,
+        ),
+        (
             "ball_reacquire_gap",
             "ball_reacquire_gap_sec",
             "ball_reacquire_gap_frames",
@@ -735,6 +846,22 @@ def resolve_temporal_parameters(args: argparse.Namespace, fps: float) -> dict[st
             "ball_reset_gap_frames",
             "--ball-reset-gap-sec",
             "--ball-reset-gap",
+            1,
+        ),
+        (
+            "ball_tracklet_split_gap",
+            "ball_tracklet_split_gap_sec",
+            "ball_tracklet_split_gap_frames",
+            "--ball-tracklet-split-gap-sec",
+            "--ball-tracklet-split-gap",
+            1,
+        ),
+        (
+            "ball_tracklet_min_duration",
+            "ball_tracklet_min_duration_sec",
+            "ball_tracklet_min_duration_frames",
+            "--ball-tracklet-min-duration-sec",
+            "--ball-tracklet-min-duration",
             1,
         ),
     ]
@@ -828,8 +955,18 @@ def load_ball_track_file(path: Path) -> dict[int, BallObservation]:
             radius=float(radius),
             confidence=confidence,
             source=str(row.get("source", "external_ball_track") or "external_ball_track"),
+            tracklet_id=parse_optional_int(row.get("tracklet_id", row.get("ball_tracklet_id"))),
         )
     return track
+
+
+def parse_optional_int(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
 
 
 def import_dependencies() -> dict[str, Any]:
@@ -2185,7 +2322,10 @@ def update_ball_state(
     reacquire_max_jump: float,
     reset_gap: int,
 ) -> BallObservation | None:
-    if state.missed >= max(1, reset_gap):
+    # Do not reset while the caller still expects predicted points. Otherwise a
+    # short occlusion could erase the protected post-serve prediction window.
+    effective_reset_gap = max(max(1, reset_gap), max(0, max_gap) + 1)
+    if state.missed >= effective_reset_gap:
         state.last = None
         state.prev = None
         state.vx = 0.0
@@ -2211,6 +2351,356 @@ def update_ball_state(
         state.last = predicted
         return predicted
     return None
+
+
+def has_credible_ball_flight(
+    points: list[BallObservation],
+    *,
+    min_points: int,
+    min_duration_frames: int,
+    min_distance: float,
+    min_speed: float,
+    max_internal_gap: int,
+) -> bool:
+    """Arm protected predictions only after sustained moving-ball evidence."""
+
+    observed = [point for point in points if point.source != "predicted"]
+    if len(observed) < min_points:
+        return False
+    suffix = [observed[-1]]
+    for point in reversed(observed[:-1]):
+        if suffix[0].frame - point.frame > max(1, max_internal_gap):
+            break
+        suffix.insert(0, point)
+    if len(suffix) < min_points:
+        return False
+    duration = suffix[-1].frame - suffix[0].frame + 1
+    if duration < min_duration_frames:
+        return False
+    distance = sum(
+        math.hypot(current.x - previous.x, current.y - previous.y)
+        for previous, current in zip(suffix, suffix[1:])
+    )
+    elapsed = max(1, suffix[-1].frame - suffix[0].frame)
+    return distance >= min_distance and distance / elapsed >= min_speed
+
+
+def filter_offline_ball_tracklets(
+    points: list[BallObservation],
+    *,
+    frame_count: int,
+    split_gap_frames: int,
+    min_duration_frames: int,
+    min_points: int,
+    min_distance: float,
+    max_link_speed: float,
+    max_speed: float,
+    max_acceleration: float,
+    max_mean_angle_change: float,
+    min_score: float,
+    serve_search_ratio: float,
+    serve_min_distance: float,
+    serve_min_speed: float,
+    toss_min_height: float,
+    toss_max_x_drift: float,
+) -> tuple[list[BallObservation], dict[str, Any]]:
+    """Score complete ball tracklets and remove weak disconnected segments.
+
+    The online Kalman-like gate deliberately allows tracking to restart after a
+    visibility gap. This offline pass keeps those restarts as explicit
+    tracklets, evaluates their full history, and prevents a short false prefix
+    from surviving merely because it was locally stable.
+    """
+
+    ordered = sorted(points, key=lambda point: point.frame)
+    if not ordered:
+        return [], {
+            "enabled": True,
+            "input_points": 0,
+            "output_points": 0,
+            "total_tracklets": 0,
+            "kept_tracklets": 0,
+            "tracklets": [],
+            "reacquisition_boundaries": [],
+        }
+
+    groups: list[list[BallObservation]] = []
+    for point in ordered:
+        if not groups:
+            groups.append([point])
+            continue
+        previous = groups[-1][-1]
+        gap = point.frame - previous.frame
+        link_speed = ball_link_speed(previous, point)
+        if gap > max(1, split_gap_frames) or link_speed > max_speed:
+            groups.append([point])
+        else:
+            groups[-1].append(point)
+
+    analyses = [
+        analyze_ball_tracklet(
+            group,
+            tracklet_id=index,
+            min_duration_frames=min_duration_frames,
+            min_points=min_points,
+            min_distance=min_distance,
+            max_speed=max_speed,
+            max_acceleration=max_acceleration,
+            max_mean_angle_change=max_mean_angle_change,
+            frame_count=frame_count,
+            serve_search_ratio=serve_search_ratio,
+            serve_min_distance=serve_min_distance,
+            serve_min_speed=serve_min_speed,
+        )
+        for index, group in enumerate(groups, start=1)
+    ]
+
+    # Only the earliest qualifying moving tracklet can represent the serve.
+    # Later rally flights may satisfy the same raw speed/smoothness thresholds,
+    # but treating all of them as serves would inflate their scores.
+    first_serve_index = next(
+        (index for index, analysis in enumerate(analyses) if analysis["serve_like"]),
+        None,
+    )
+    for index, analysis in enumerate(analyses):
+        analysis["serve_like_candidate"] = analysis["serve_like"]
+        analysis["serve_like"] = index == first_serve_index
+
+    for index, analysis in enumerate(analyses):
+        previous_link = tracklet_boundary_metrics(groups[index - 1], groups[index]) if index > 0 else None
+        next_link = tracklet_boundary_metrics(groups[index], groups[index + 1]) if index + 1 < len(groups) else None
+        analysis["previous_link"] = previous_link
+        analysis["next_link"] = next_link
+        previous_plausible = bool(previous_link and previous_link["required_speed_px_per_frame"] <= max_link_speed)
+        next_plausible = bool(next_link and next_link["required_speed_px_per_frame"] <= max_link_speed)
+        analysis["plausible_previous_continuation"] = previous_plausible
+        analysis["plausible_next_continuation"] = next_plausible
+
+    for index, analysis in enumerate(analyses):
+        next_analysis = analyses[index + 1] if index + 1 < len(analyses) else None
+        next_is_serve = bool(next_analysis and next_analysis["serve_like"])
+        toss_like = (
+            not analysis["serve_like"]
+            and analysis["start_frame"] <= int(frame_count * serve_search_ratio)
+            and analysis["vertical_range_px"] >= toss_min_height
+            and analysis["horizontal_span_px"] <= toss_max_x_drift
+            and analysis["vertical_motion_px"] > analysis["horizontal_motion_px"] * 1.5
+            and next_is_serve
+            and analysis["plausible_next_continuation"]
+        )
+        bridge_like = (
+            analysis["point_count"] >= max(3, min_points // 2)
+            and analysis["distance_px"] >= min_distance * 0.5
+            and analysis["plausible_previous_continuation"]
+            and analysis["plausible_next_continuation"]
+        )
+        independent = (
+            analysis["point_count"] >= min_points
+            and analysis["duration_frames"] >= min_duration_frames
+            and analysis["distance_px"] >= min_distance
+        )
+        protected_post_serve_predictions = (
+            first_serve_index is not None
+            and index >= first_serve_index
+            and analysis["predicted_point_count"] > 0
+            and (
+                independent
+                or (
+                    analysis["plausible_previous_continuation"]
+                    and analysis["plausible_next_continuation"]
+                )
+            )
+        )
+        continuation_score = max(
+            float(analysis["plausible_previous_continuation"]),
+            float(analysis["plausible_next_continuation"]),
+        )
+        event_score = 1.0 if analysis["serve_like"] else min(1.0, analysis["strong_turn_count"] / 2.0)
+        score = (
+            0.15 * min(1.0, analysis["point_count"] / max(1, min_points))
+            + 0.10 * min(1.0, analysis["duration_frames"] / max(1, min_duration_frames))
+            + 0.20 * min(1.0, analysis["distance_px"] / max(1.0, min_distance))
+            + 0.10 * analysis["density"]
+            + 0.12 * analysis["smoothness_score"]
+            + 0.10 * analysis["realistic_speed_fraction"]
+            + 0.08 * analysis["realistic_acceleration_fraction"]
+            + 0.08 * continuation_score
+            + 0.07 * event_score
+            + (0.10 if toss_like else 0.0)
+        )
+        eligible = independent or analysis["serve_like"] or toss_like or bridge_like or protected_post_serve_predictions
+        kept = bool(protected_post_serve_predictions or (eligible and score >= min_score))
+        if protected_post_serve_predictions:
+            reason = "protected predicted trajectory after serve"
+        elif not eligible:
+            reason = "insufficient complete-tracklet evidence"
+        elif score < min_score:
+            reason = "tracklet score below threshold"
+        elif toss_like:
+            reason = "serve toss linked to outbound flight"
+        elif analysis["serve_like"]:
+            reason = "early serve-like trajectory"
+        elif bridge_like and not independent:
+            reason = "short tracklet bridges plausible rally continuations"
+        else:
+            reason = "duration, detections, motion, and realism passed"
+        analysis.update(
+            {
+                "score": round(score, 6),
+                "kept": kept,
+                "decision_reason": reason,
+                "independently_credible": independent,
+                "toss_like": toss_like,
+                "bridge_like": bridge_like,
+                "protected_post_serve_predictions": protected_post_serve_predictions,
+            }
+        )
+
+    kept_points: list[BallObservation] = []
+    for group, analysis in zip(groups, analyses):
+        for point in group:
+            point.tracklet_id = int(analysis["tracklet_id"])
+        if analysis["kept"]:
+            kept_points.extend(group)
+
+    boundaries = []
+    for index in range(1, len(groups)):
+        metrics = tracklet_boundary_metrics(groups[index - 1], groups[index])
+        metrics.update(
+            {
+                "from_tracklet_id": analyses[index - 1]["tracklet_id"],
+                "to_tracklet_id": analyses[index]["tracklet_id"],
+                "from_kept": analyses[index - 1]["kept"],
+                "to_kept": analyses[index]["kept"],
+            }
+        )
+        boundaries.append(metrics)
+
+    return kept_points, {
+        "enabled": True,
+        "input_points": len(ordered),
+        "output_points": len(kept_points),
+        "removed_points": len(ordered) - len(kept_points),
+        "total_tracklets": len(analyses),
+        "kept_tracklets": sum(1 for analysis in analyses if analysis["kept"]),
+        "split_gap_frames": int(split_gap_frames),
+        "minimum_duration_frames": int(min_duration_frames),
+        "minimum_points": int(min_points),
+        "minimum_distance_px": float(min_distance),
+        "minimum_score": float(min_score),
+        "tracklets": analyses,
+        "reacquisition_boundaries": boundaries,
+    }
+
+
+def analyze_ball_tracklet(
+    points: list[BallObservation],
+    *,
+    tracklet_id: int,
+    min_duration_frames: int,
+    min_points: int,
+    min_distance: float,
+    max_speed: float,
+    max_acceleration: float,
+    max_mean_angle_change: float,
+    frame_count: int,
+    serve_search_ratio: float,
+    serve_min_distance: float,
+    serve_min_speed: float,
+) -> dict[str, Any]:
+    vectors: list[tuple[float, float, float, int]] = []
+    distance = 0.0
+    for previous, current in zip(points, points[1:]):
+        dt = max(1, current.frame - previous.frame)
+        dx = current.x - previous.x
+        dy = current.y - previous.y
+        distance += math.hypot(dx, dy)
+        vectors.append((dx / dt, dy / dt, math.hypot(dx, dy) / dt, dt))
+
+    angles = []
+    accelerations = []
+    for previous, current in zip(vectors, vectors[1:]):
+        previous_speed = math.hypot(previous[0], previous[1])
+        current_speed = math.hypot(current[0], current[1])
+        if previous_speed >= 0.5 and current_speed >= 0.5:
+            cosine = (previous[0] * current[0] + previous[1] * current[1]) / (previous_speed * current_speed)
+            angles.append(math.degrees(math.acos(max(-1.0, min(1.0, cosine)))))
+        dt = max(1.0, (previous[3] + current[3]) / 2.0)
+        accelerations.append(math.hypot(current[0] - previous[0], current[1] - previous[1]) / dt)
+
+    duration = max(1, points[-1].frame - points[0].frame + 1)
+    speeds = [vector[2] for vector in vectors]
+    mean_angle = sum(angles) / len(angles) if angles else 0.0
+    mean_speed = distance / max(1, points[-1].frame - points[0].frame)
+    realistic_speed_fraction = sum(speed <= max_speed for speed in speeds) / len(speeds) if speeds else 1.0
+    realistic_acceleration_fraction = (
+        sum(value <= max_acceleration for value in accelerations) / len(accelerations)
+        if accelerations
+        else 1.0
+    )
+    xs = [point.x for point in points]
+    ys = [point.y for point in points]
+    horizontal_motion = sum(abs(current.x - previous.x) for previous, current in zip(points, points[1:]))
+    vertical_motion = sum(abs(current.y - previous.y) for previous, current in zip(points, points[1:]))
+    serve_like = (
+        points[0].frame <= int(frame_count * serve_search_ratio)
+        and len(points) >= min_points
+        and duration >= min_duration_frames
+        and distance >= serve_min_distance
+        and mean_speed >= serve_min_speed
+        and mean_angle <= max_mean_angle_change
+    )
+    return {
+        "tracklet_id": tracklet_id,
+        "start_frame": points[0].frame,
+        "end_frame": points[-1].frame,
+        "duration_frames": duration,
+        "point_count": len(points),
+        "predicted_point_count": sum(point.source == "predicted" for point in points),
+        "density": round(len(points) / duration, 6),
+        "distance_px": round(distance, 6),
+        "net_displacement_px": round(math.hypot(points[-1].x - points[0].x, points[-1].y - points[0].y), 6),
+        "mean_speed_px_per_frame": round(mean_speed, 6),
+        "max_speed_px_per_frame": round(max(speeds, default=0.0), 6),
+        "max_acceleration_px_per_frame2": round(max(accelerations, default=0.0), 6),
+        "mean_angle_change_deg": round(mean_angle, 6),
+        "strong_turn_count": sum(angle >= 70.0 for angle in angles),
+        "horizontal_span_px": round(max(xs) - min(xs), 6),
+        "vertical_range_px": round(max(ys) - min(ys), 6),
+        "horizontal_motion_px": round(horizontal_motion, 6),
+        "vertical_motion_px": round(vertical_motion, 6),
+        "smoothness_score": round(max(0.0, 1.0 - mean_angle / max(1.0, max_mean_angle_change)), 6),
+        "realistic_speed_fraction": round(realistic_speed_fraction, 6),
+        "realistic_acceleration_fraction": round(realistic_acceleration_fraction, 6),
+        "serve_like": serve_like,
+        "base_evidence": {
+            "minimum_duration_passed": duration >= min_duration_frames,
+            "minimum_points_passed": len(points) >= min_points,
+            "minimum_distance_passed": distance >= min_distance,
+        },
+    }
+
+
+def ball_link_speed(previous: BallObservation, current: BallObservation) -> float:
+    dt = max(1, current.frame - previous.frame)
+    return math.hypot(current.x - previous.x, current.y - previous.y) / dt
+
+
+def tracklet_boundary_metrics(
+    previous: list[BallObservation],
+    current: list[BallObservation],
+) -> dict[str, Any]:
+    before = previous[-1]
+    after = current[0]
+    frame_gap = max(1, after.frame - before.frame)
+    distance = math.hypot(after.x - before.x, after.y - before.y)
+    return {
+        "visible_before_frame": before.frame,
+        "visible_after_frame": after.frame,
+        "frame_gap": frame_gap,
+        "distance_px": round(distance, 6),
+        "required_speed_px_per_frame": round(distance / frame_gap, 6),
+    }
 
 
 def choose_ball_candidate(
@@ -2754,7 +3244,12 @@ def draw_debug_frame(
         cv2.putText(out, label, (x1, max(24, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 3)
         cv2.putText(out, label, (x1, max(24, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, text_color, 2)
     if ball:
-        recent = [point for point in ball_track[-trail_length:] if current_frame - point.frame <= trail_length]
+        recent = [
+            point
+            for point in ball_track
+            if 0 <= current_frame - point.frame <= trail_length
+            and (ball.tracklet_id is None or point.tracklet_id == ball.tracklet_id)
+        ][-trail_length:]
         for idx in range(1, len(recent)):
             prev = recent[idx - 1]
             cur = recent[idx]
@@ -3037,6 +3532,7 @@ def write_csv(
         "y2",
         "ball_x",
         "ball_y",
+        "ball_tracklet_id",
         "confidence",
         "source",
         "player_distance",
@@ -3069,6 +3565,7 @@ def write_csv(
                     "y2": "",
                     "ball_x": round(ball.x, 3),
                     "ball_y": round(ball.y, 3),
+                    "ball_tracklet_id": ball.tracklet_id if ball.tracklet_id is not None else "",
                     "confidence": round(ball.confidence, 6),
                     "source": ball.source,
                     "player_distance": "",

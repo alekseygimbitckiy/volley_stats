@@ -26,6 +26,7 @@ class BallPoint:
     y: float
     radius: float
     confidence: float
+    tracklet_id: int | None = None
 
 
 @dataclass
@@ -66,6 +67,7 @@ class BallState:
             y=self.last.y + self.vy * dt,
             radius=self.last.radius,
             confidence=max(0.05, self.last.confidence * (0.72 ** dt)),
+            tracklet_id=self.last.tracklet_id,
         )
 
     def update(self, point: BallPoint) -> None:
@@ -111,6 +113,76 @@ def main() -> int:
     parser.add_argument("--serve-min-distance", type=float, default=120.0, help="Minimum total ball displacement for a serve flight.")
     parser.add_argument("--serve-max-mean-angle-change", type=float, default=38.0, help="Max mean trajectory angle change inside a smooth serve flight.")
     parser.add_argument("--serve-early-bonus", type=float, default=0.35, help="How strongly to prefer earlier smooth serve flights.")
+    parser.add_argument(
+        "--serve-toss-search-sec",
+        type=float,
+        default=1.50,
+        help="Seconds before serve flight searched for a compact near-vertical toss and the serve contact.",
+    )
+    parser.add_argument(
+        "--serve-contact-max-gap-sec",
+        type=float,
+        default=0.33,
+        help="Largest ball-visibility gap allowed between the last toss point/contact and the outbound serve flight.",
+    )
+    parser.add_argument(
+        "--serve-contact-flight-sec",
+        type=float,
+        default=1.0,
+        help=(
+            "Seconds after a toss/contact candidate used to validate the outbound serve flight. "
+            "Validation stops before the next strong direction change."
+        ),
+    )
+    parser.add_argument(
+        "--serve-contact-flight",
+        dest="serve_contact_flight_frames",
+        type=int,
+        default=None,
+        help="Deprecated frame override for --serve-contact-flight-sec.",
+    )
+    parser.add_argument(
+        "--serve-contact-min-speed",
+        type=float,
+        default=4.0,
+        help="Minimum average speed in px/frame for the longer post-contact serve validation window.",
+    )
+    parser.add_argument(
+        "--serve-contact-player-max-distance",
+        type=float,
+        default=220.0,
+        help="Maximum ball-to-player upper-body/wrist distance when identifying the server.",
+    )
+    parser.add_argument(
+        "--serve-toss-max-x-drift",
+        type=float,
+        default=80.0,
+        help="Maximum horizontal span in pixels for points considered part of the serve toss.",
+    )
+    parser.add_argument(
+        "--serve-toss-min-vertical-motion",
+        type=float,
+        default=6.0,
+        help="Minimum vertical toss motion in pixels needed to claim that serve contact is visible.",
+    )
+    parser.add_argument(
+        "--serve-toss-min-vertical-x-ratio",
+        type=float,
+        default=2.0,
+        help="Minimum ratio of vertical to horizontal toss motion; rejects ordinary diagonal serve flight as a toss.",
+    )
+    parser.add_argument(
+        "--serve-power-toss-min-height",
+        type=float,
+        default=70.0,
+        help="Vertical toss range in pixels that classifies a captured serve as a power serve.",
+    )
+    parser.add_argument(
+        "--serve-power-min-speed",
+        type=float,
+        default=20.0,
+        help="Minimum outbound speed used as supporting power-serve evidence when only part of the toss is visible.",
+    )
     parser.add_argument("--reception-min-angle-change", type=float, default=135.0)
     parser.add_argument("--reception-window-sec", type=float, default=4 / 30, help="Seconds before/after a ball point used to estimate trajectory change.")
     parser.add_argument("--reception-window", dest="reception_window_frames", type=int, default=None, help="Deprecated frame override for --reception-window-sec.")
@@ -148,6 +220,22 @@ def main() -> int:
     )
     parser.add_argument("--player-draw-max-gap-sec", type=float, default=12 / 30, help="Draw the latest player box within this many seconds, matching test_track_video.py.")
     parser.add_argument("--player-draw-max-gap", dest="player_draw_max_gap_frames", type=int, default=None, help="Deprecated frame override for --player-draw-max-gap-sec.")
+    parser.add_argument(
+        "--pass-origin-lookback-sec",
+        type=float,
+        default=0.20,
+        help=(
+            "Seconds before the pass searched for the passer foot point with maximum image y. "
+            "This uses the grounded/takeoff position when the setter makes a jump pass."
+        ),
+    )
+    parser.add_argument(
+        "--pass-origin-lookback",
+        dest="pass_origin_lookback_frames",
+        type=int,
+        default=None,
+        help="Deprecated frame override for --pass-origin-lookback-sec.",
+    )
     parser.add_argument(
         "--pose-svm-model",
         default=None,
@@ -223,7 +311,8 @@ def main() -> int:
 
     court_polygon = load_layout_polygon(layout_path) if args.team_filter != "none" else []
     reception_zones = load_reception_zones(reception_zones_path)
-    render_player_boxes_by_frame = dedupe_player_boxes_by_label(load_player_boxes(tracking_path))
+    all_player_boxes_by_frame = load_player_boxes(tracking_path)
+    render_player_boxes_by_frame = dedupe_player_boxes_by_label(all_player_boxes_by_frame)
     player_boxes_by_frame = filter_player_boxes_by_team(
         render_player_boxes_by_frame,
         court_polygon,
@@ -231,9 +320,27 @@ def main() -> int:
     )
     player_boxes_by_frame = dedupe_player_boxes_by_label(player_boxes_by_frame)
     render_player_tracks_by_id = player_tracks_from_boxes(render_player_boxes_by_frame)
+    scoring_player_tracks_by_id = player_tracks_from_boxes(
+        filter_player_boxes_by_team(all_player_boxes_by_frame, court_polygon, args.team_filter)
+    )
+    pose_classifier = load_pose_classifier(args) if args.pose_svm_model else None
     serve, reception = classify_serve_and_reception(ball_points, max_frames, args)
     serve["time_sec"] = serve["frame"] / fps
-    pose_classifier = load_pose_classifier(args) if args.pose_svm_model else None
+    if serve.get("contact_captured"):
+        contact_player = find_serve_contact_player(
+            cv2=cv2,
+            video_path=video_path,
+            player_boxes_by_frame=all_player_boxes_by_frame,
+            ball_x=float(serve["x"]),
+            ball_y=float(serve["y"]),
+            contact_frame=int(serve["frame"]),
+            serving_team=str(serve.get("serving_team") or "unknown"),
+            frame_window=args.receiver_frame_window,
+            max_distance=float(args.serve_contact_player_max_distance),
+            pose_classifier=pose_classifier,
+        )
+        if contact_player is not None:
+            serve["contact_player"] = contact_player
     actions = classify_actions_after_serve(
         cv2=cv2,
         video_path=video_path,
@@ -244,7 +351,13 @@ def main() -> int:
         args=args,
         pose_classifier=pose_classifier,
     )
-    reception_evaluation = evaluate_reception_quality(actions, reception_zones, args.receive_prob_threshold)
+    reception_evaluation = evaluate_reception_quality(
+        actions,
+        reception_zones,
+        args.receive_prob_threshold,
+        player_tracks_by_id=scoring_player_tracks_by_id,
+        pass_origin_lookback_frames=args.pass_origin_lookback,
+    )
     reception, receiver = first_receive_action(actions)
 
     output_dir = resolve_path(args.output_dir)
@@ -267,7 +380,7 @@ def main() -> int:
         "raw_ball_points": len(raw_ball_points),
         "filtered_ball_points": len(ball_points),
         "assumptions": {
-            "serve_model": "early smooth high-speed ball flight",
+            "serve_model": "contact-first compact toss followed by validated outbound flight, with smooth-flight fallback",
             "action_model": "each grouped strong trajectory reversal after serve flight",
             "receive_model": f"SVM wait probability below {args.receive_wait_prob_threshold}",
             "one_rally_per_video": True,
@@ -309,6 +422,7 @@ def main() -> int:
 
     print(
         f"Serve: frame={serve['frame']} team={serve['serving_team']} "
+        f"type={serve.get('serve_type', 'unknown')} contact_captured={serve.get('contact_captured', False)} "
         f"speed={serve['avg_speed_px_per_frame']:.2f} smooth_angle={serve['mean_angle_change_deg']:.1f}"
     )
     if not actions:
@@ -355,6 +469,13 @@ def main() -> int:
         if reception_evaluation.get("pass"):
             pass_info = reception_evaluation["pass"]
             print(f"Pass: frame={pass_info.get('frame')} passer={pass_info.get('passer')}")
+            origin = pass_info.get("origin_court_anchor") or {}
+            if origin:
+                print(
+                    f"Pass origin: frame={origin.get('frame')} "
+                    f"point=({origin.get('x'):.1f}, {origin.get('y'):.1f}) "
+                    f"method={origin.get('method')}"
+                )
     else:
         print(f"Reception evaluation: unavailable ({reception_evaluation.get('reason')})")
     print(f"Saved JSON: {json_path}")
@@ -399,6 +520,38 @@ def resolve_temporal_parameters(args: argparse.Namespace, fps: float) -> dict[st
             "--player-draw-max-gap-sec",
             "--player-draw-max-gap",
             0,
+        ),
+        (
+            "pass_origin_lookback",
+            "pass_origin_lookback_sec",
+            "pass_origin_lookback_frames",
+            "--pass-origin-lookback-sec",
+            "--pass-origin-lookback",
+            0,
+        ),
+        (
+            "serve_toss_search",
+            "serve_toss_search_sec",
+            "serve_toss_search_frames",
+            "--serve-toss-search-sec",
+            "--serve-toss-search",
+            1,
+        ),
+        (
+            "serve_contact_max_gap",
+            "serve_contact_max_gap_sec",
+            "serve_contact_max_gap_frames",
+            "--serve-contact-max-gap-sec",
+            "--serve-contact-max-gap",
+            1,
+        ),
+        (
+            "serve_contact_flight",
+            "serve_contact_flight_sec",
+            "serve_contact_flight_frames",
+            "--serve-contact-flight-sec",
+            "--serve-contact-flight",
+            1,
         ),
         ("max_ball_gap", "max_ball_gap_sec", "max_ball_gap_frames", "--max-ball-gap-sec", "--max-ball-gap", 0),
         (
@@ -685,9 +838,19 @@ def load_ball_track(path: Path) -> list[BallPoint]:
                 y=float(y),
                 radius=max(5.0, (width + height) / 4),
                 confidence=float(row.get("confidence", row.get("Confidence", 1.0)) or 0),
+                tracklet_id=parse_optional_int(row.get("tracklet_id", row.get("ball_tracklet_id"))),
             )
         )
     return sorted(points, key=lambda item: item.frame)
+
+
+def parse_optional_int(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
 
 
 def filter_ball_track(
@@ -930,7 +1093,22 @@ def classify_serve_and_reception(
     smoothed = smooth_points(points)
     reception_candidates = detect_reception_candidates(smoothed, args)
 
-    for reception in reception_candidates:
+    # A tossed serve and a reception both create a sharp trajectory change.
+    # Resolve a compact toss -> contact -> outbound-flight transition first;
+    # otherwise the serve contact itself is unconditionally consumed as the
+    # first reception candidate.
+    contact_serve = detect_toss_contact_serve(
+        points=smoothed,
+        reception_candidates=reception_candidates,
+        frame_count=frame_count,
+        args=args,
+    )
+    if contact_serve is not None:
+        reception = first_reception_after(smoothed, int(contact_serve["window_end_frame"]), args)
+        return contact_serve, reception
+
+    if reception_candidates:
+        reception = reception_candidates[0]
         serve = detect_smooth_serve_before(
             points=smoothed,
             frame_count=frame_count,
@@ -942,6 +1120,12 @@ def classify_serve_and_reception(
             serve["receiving_team"] = "near"
             serve["detection_reason"] = "smooth early serve flight before strong trajectory reversal"
             return serve, reception
+
+        # Do not search progressively later contact candidates: a rally flight
+        # can otherwise be relabeled as a serve merely because the true serve
+        # contact/flight was not captured. Keep the first contact candidate and
+        # record the earliest retained ball point as an uncaptured-flight hint.
+        return uncaptured_serve_fallback(smoothed, reception), reception
 
     serve = detect_smooth_serve_before(
         points=smoothed,
@@ -962,6 +1146,183 @@ def classify_serve_and_reception(
     serve["serving_team"] = "near"
     serve["receiving_team"] = "far"
     return serve, None
+
+
+def detect_toss_contact_serve(
+    points: list[BallPoint],
+    reception_candidates: list[dict[str, Any]],
+    frame_count: int,
+    args: argparse.Namespace,
+) -> dict[str, Any] | None:
+    """Find an early toss/contact before interpreting sharp turns as receptions.
+
+    A contact candidate must end a compact, predominantly vertical toss and be
+    followed by a smooth outbound trajectory.  The outbound validation is
+    deliberately longer than the legacy serve window for rear-camera views,
+    but is cut off immediately before the next sharp turn so a real reception
+    remains available to the action classifier.
+    """
+
+    if not points or not reception_candidates:
+        return None
+
+    ordered = sorted(points, key=lambda point: point.frame)
+    by_frame = {point.frame: point for point in ordered}
+    search_until = int(frame_count * float(args.serve_search_ratio))
+    validation_frames = int(getattr(args, "serve_contact_flight", args.serve_window))
+    min_flight_speed = float(getattr(args, "serve_contact_min_speed", args.serve_min_speed))
+    transitions: list[tuple[float, dict[str, Any]]] = []
+
+    for index, candidate in enumerate(reception_candidates):
+        contact_frame = int(candidate["frame"])
+        if contact_frame >= search_until:
+            continue
+        contact = by_frame.get(contact_frame)
+        if contact is None:
+            contact = nearest_point(by_frame, contact_frame, -1, max(1, args.reception_window))
+        if contact is None:
+            continue
+
+        toss_points = compact_toss_suffix(
+            ordered,
+            end_frame=contact.frame,
+            max_frames=int(args.serve_toss_search),
+            max_x_drift=float(args.serve_toss_max_x_drift),
+        )
+        if len(toss_points) < 3:
+            continue
+        toss = serve_toss_stats(toss_points)
+        if toss["x_span_px"] > float(args.serve_toss_max_x_drift):
+            continue
+        if toss["vertical_motion_px"] < float(args.serve_toss_min_vertical_motion):
+            continue
+        if toss["vertical_to_horizontal_motion_ratio"] < float(args.serve_toss_min_vertical_x_ratio):
+            continue
+
+        next_contact_frame = None
+        for later in reception_candidates[index + 1 :]:
+            if int(later["frame"]) > contact.frame:
+                next_contact_frame = int(later["frame"])
+                break
+        validation_end = contact.frame + validation_frames
+        if next_contact_frame is not None:
+            validation_end = min(validation_end, next_contact_frame - 1)
+        if validation_end <= contact.frame:
+            continue
+
+        flight = segment_points(
+            by_frame,
+            contact.frame,
+            validation_end - contact.frame,
+            max_gap=2,
+        )
+        minimum_points = max(5, min(int(args.serve_window), validation_end - contact.frame + 1) // 2)
+        if len(flight) < minimum_points or flight[-1].frame <= contact.frame:
+            continue
+        flight_stats = trajectory_stats(flight)
+        if flight_stats["distance"] < float(args.serve_min_distance):
+            continue
+        if flight_stats["avg_speed"] < min_flight_speed:
+            continue
+        if flight_stats["mean_angle_change"] > float(args.serve_max_mean_angle_change):
+            continue
+
+        toss_center_x = sorted(point.x for point in toss_points)[len(toss_points) // 2]
+        departure_x = max(abs(point.x - toss_center_x) for point in flight[1:])
+        minimum_departure = max(10.0, toss["x_span_px"] * 1.5)
+        if departure_x <= minimum_departure:
+            continue
+
+        serve_type, type_reason = classify_serve_type(toss, flight_stats, args)
+        serving_team = "far" if flight_stats["y_speed"] > 0 else "near"
+        receiving_team = "near" if serving_team == "far" else "far"
+        score = (
+            float(candidate.get("angle_change_deg", 0.0))
+            + toss["vertical_motion_px"] * 0.20
+            + flight_stats["distance"] * 0.10
+            + flight_stats["avg_speed"]
+            - contact.frame / max(1, search_until) * 10.0
+        )
+        transitions.append(
+            (
+                score,
+                {
+                    "frame": contact.frame,
+                    "time_sec": None,
+                    "x": contact.x,
+                    "y": contact.y,
+                    "window_end_frame": flight[-1].frame,
+                    "window_end_x": flight[-1].x,
+                    "window_end_y": flight[-1].y,
+                    "direction": "toward_near_team" if serving_team == "far" else "toward_far_team",
+                    "serving_team": serving_team,
+                    "receiving_team": receiving_team,
+                    "y_speed_px_per_frame": flight_stats["y_speed"],
+                    "avg_speed_px_per_frame": flight_stats["avg_speed"],
+                    "total_distance_px": flight_stats["distance"],
+                    "mean_angle_change_deg": flight_stats["mean_angle_change"],
+                    "serve_type": serve_type,
+                    "serve_type_reason": type_reason,
+                    "contact_captured": True,
+                    "contact_detection_reason": "compact toss ending at a sharp turn followed by outbound flight",
+                    "flight_start_frame": flight[1].frame,
+                    "flight_start_x": flight[1].x,
+                    "flight_start_y": flight[1].y,
+                    "contact_to_flight_gap_frames": flight[1].frame - contact.frame,
+                    "toss": toss,
+                    "contact_candidate": {
+                        "angle_change_deg": candidate.get("angle_change_deg"),
+                        "speed_before_px_per_frame": candidate.get("speed_before_px_per_frame"),
+                        "speed_after_px_per_frame": candidate.get("speed_after_px_per_frame"),
+                        "outbound_validation_end_frame": flight[-1].frame,
+                        "outbound_departure_x_px": departure_x,
+                    },
+                    "detection_reason": "contact-first toss-to-flight transition before reception classification",
+                },
+            )
+        )
+
+    if not transitions:
+        return None
+
+    # Prefer the earliest credible transition.  Later rally contacts can have a
+    # larger raw score, but cannot be the serve once an earlier toss/contact is
+    # already supported by a valid outbound flight.
+    earliest_frame = min(int(item[1]["frame"]) for item in transitions)
+    earliest = [item for item in transitions if int(item[1]["frame"]) == earliest_frame]
+    return max(earliest, key=lambda item: item[0])[1]
+
+
+def uncaptured_serve_fallback(
+    points: list[BallPoint],
+    first_reception: dict[str, Any],
+) -> dict[str, Any]:
+    before_reception = [point for point in points if point.frame < int(first_reception["frame"])]
+    hint = before_reception[0] if before_reception else points[0]
+    return {
+        "frame": hint.frame,
+        "time_sec": None,
+        "x": hint.x,
+        "y": hint.y,
+        "window_end_frame": hint.frame,
+        "window_end_x": hint.x,
+        "window_end_y": hint.y,
+        "direction": "unknown",
+        "serving_team": "far",
+        "receiving_team": "near",
+        "y_speed_px_per_frame": 0.0,
+        "avg_speed_px_per_frame": 0.0,
+        "total_distance_px": 0.0,
+        "mean_angle_change_deg": 0.0,
+        "serve_type": "unknown",
+        "contact_captured": False,
+        "contact_detection_reason": "no valid serve flight before the first contact candidate",
+        "flight_start_frame": hint.frame,
+        "flight_start_x": hint.x,
+        "flight_start_y": hint.y,
+        "toss": None,
+        "detection_reason": "serve moment not captured; first retained action is a reception candidate",
+    }
 
 
 def classify_actions_after_serve(
@@ -1045,6 +1406,8 @@ def evaluate_reception_quality(
     actions: list[dict[str, Any]],
     zones: list[dict[str, Any]],
     receive_probability_threshold: float,
+    player_tracks_by_id: dict[str, list[PlayerBox]] | None = None,
+    pass_origin_lookback_frames: int = 0,
 ) -> dict[str, Any]:
     reception_action = first_action_with_receive_probability(actions, receive_probability_threshold)
     if reception_action is None:
@@ -1078,12 +1441,49 @@ def evaluate_reception_quality(
     pass_action["role"] = "pass"
     pass_action["action_type"] = "pass"
     passer = pass_action.get("receiver") or {}
-    passer_anchor = court_anchor_from_receiver(passer)
+    pass_frame = int(pass_action["frame"])
+    pass_time_position = find_pass_origin_anchor(
+        passer=passer,
+        player_tracks_by_id=player_tracks_by_id or {},
+        pass_frame=pass_frame,
+        lookback_frames=0,
+    )
+    if pass_time_position is not None:
+        pass_time_anchor = (float(pass_time_position["x"]), float(pass_time_position["y"]))
+    else:
+        pass_time_anchor = court_anchor_from_receiver(passer)
+    pass_origin = find_pass_origin_anchor(
+        passer=passer,
+        player_tracks_by_id=player_tracks_by_id or {},
+        pass_frame=pass_frame,
+        lookback_frames=pass_origin_lookback_frames,
+    )
+    if pass_origin is None and pass_time_anchor is not None:
+        pass_origin = {
+            "x": pass_time_anchor[0],
+            "y": pass_time_anchor[1],
+            "frame": pass_frame,
+            "track_id": passer.get("track_id"),
+            "player_id": passer.get("player_id"),
+            "observed": None,
+            "method": "pass_receiver_box_fallback",
+        }
+    passer_anchor = (float(pass_origin["x"]), float(pass_origin["y"])) if pass_origin else None
     pass_info = {
-        "frame": pass_action["frame"],
+        "frame": pass_frame,
         "passer": player_label_from_action(pass_action),
         "vy_before_px_per_frame": pass_action.get("vy_before_px_per_frame"),
         "vy_after_px_per_frame": pass_action.get("vy_after_px_per_frame"),
+        "pass_time_court_anchor": (
+            {"x": pass_time_anchor[0], "y": pass_time_anchor[1]}
+            if pass_time_anchor
+            else None
+        ),
+        "origin_search_start_frame": max(0, pass_frame - max(0, pass_origin_lookback_frames)),
+        "origin_search_end_frame": pass_frame,
+        "origin_lookback_frames": max(0, pass_origin_lookback_frames),
+        "origin_court_anchor": pass_origin,
+        # Backward-compatible field: this is now the grounded/takeoff point used for scoring.
         "court_anchor": {"x": passer_anchor[0], "y": passer_anchor[1]} if passer_anchor else None,
     }
     result["pass"] = pass_info
@@ -1110,6 +1510,62 @@ def evaluate_reception_quality(
     }
     reception_action["reception_score"] = score
     return result
+
+
+def find_pass_origin_anchor(
+    passer: dict[str, Any],
+    player_tracks_by_id: dict[str, list[PlayerBox]],
+    pass_frame: int,
+    lookback_frames: int,
+) -> dict[str, Any] | None:
+    """Find the passer's lowest foot point shortly before a pass.
+
+    Image y grows downward, so maximum y represents the lowest/most grounded
+    tracked position. This avoids scoring a jumping setter at their airborne
+    pass-time position.
+    """
+
+    start_frame = max(0, int(pass_frame) - max(0, int(lookback_frames)))
+    end_frame = int(pass_frame)
+    track_id = str(passer.get("track_id") or "")
+    player_id = str(passer.get("player_id") or "")
+
+    candidates = [
+        box
+        for box in player_tracks_by_id.get(track_id, [])
+        if start_frame <= box.frame <= end_frame
+    ]
+    method = "max_y_same_track_pre_pass"
+    if not candidates and player_id:
+        candidates = [
+            box
+            for boxes in player_tracks_by_id.values()
+            for box in boxes
+            if box.player_id == player_id and start_frame <= box.frame <= end_frame
+        ]
+        method = "max_y_same_player_pre_pass"
+    if not candidates:
+        return None
+
+    observed = [box for box in candidates if box.observed]
+    if observed:
+        candidates = observed
+    else:
+        method += "_predicted"
+    selected = max(
+        candidates,
+        key=lambda box: (box.court_anchor[1], box.frame, box.confidence or 0.0),
+    )
+    x, y = selected.court_anchor
+    return {
+        "x": x,
+        "y": y,
+        "frame": selected.frame,
+        "track_id": selected.track_id,
+        "player_id": selected.player_id,
+        "observed": selected.observed,
+        "method": method,
+    }
 
 
 def first_action_with_receive_probability(
@@ -1222,7 +1678,7 @@ def detect_smooth_serve_before(
         return None
 
     _score, start, end, stats = max(candidates, key=lambda item: item[0])
-    return {
+    serve = {
         "frame": start.frame,
         "time_sec": None,
         "x": start.x,
@@ -1238,6 +1694,223 @@ def detect_smooth_serve_before(
         "total_distance_px": stats["distance"],
         "mean_angle_change_deg": stats["mean_angle_change"],
     }
+    return refine_serve_contact_and_type(points, serve, args)
+
+
+def refine_serve_contact_and_type(
+    points: list[BallPoint],
+    serve: dict[str, Any],
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    """Separate a compact vertical toss from the outbound serve flight.
+
+    The last point in the compact toss is treated as the contact location. A
+    large visibility gap is permitted because fast serves are frequently missed
+    for several frames immediately after contact. If no compact toss-to-flight
+    transition is visible, the existing flight start is retained and explicitly
+    marked as a fallback rather than claiming that contact was observed.
+    """
+
+    ordered = sorted(points, key=lambda point: point.frame)
+    search_end = int(serve["window_end_frame"])
+    search_start = max(0, int(serve["frame"]) - int(args.serve_toss_search))
+    local = [point for point in ordered if search_start <= point.frame <= search_end]
+    transitions: list[tuple[float, dict[str, Any]]] = []
+
+    for previous, outbound_start in zip(local, local[1:]):
+        gap = outbound_start.frame - previous.frame
+        if gap <= 0 or gap > int(args.serve_contact_max_gap):
+            continue
+
+        toss_points = compact_toss_suffix(
+            local,
+            end_frame=previous.frame,
+            max_frames=int(args.serve_toss_search),
+            max_x_drift=float(args.serve_toss_max_x_drift),
+        )
+        if len(toss_points) < 3:
+            continue
+
+        toss = serve_toss_stats(toss_points)
+        if toss["x_span_px"] > float(args.serve_toss_max_x_drift):
+            continue
+        if toss["vertical_motion_px"] < float(args.serve_toss_min_vertical_motion):
+            continue
+        if toss["vertical_to_horizontal_motion_ratio"] < float(args.serve_toss_min_vertical_x_ratio):
+            continue
+
+        by_frame = {point.frame: point for point in ordered}
+        flight = [previous]
+        flight.extend(
+            point
+            for point in segment_points(
+                by_frame,
+                outbound_start.frame,
+                int(args.serve_window),
+                max_gap=2,
+            )
+            if point.frame > previous.frame
+        )
+        if len(flight) < max(5, int(args.serve_window) // 2):
+            continue
+        flight_stats = trajectory_stats(flight)
+        if flight_stats["distance"] < float(args.serve_min_distance):
+            continue
+        if flight_stats["avg_speed"] < float(args.serve_min_speed):
+            continue
+        if flight_stats["mean_angle_change"] > float(args.serve_max_mean_angle_change):
+            continue
+
+        toss_center_x = sorted(point.x for point in toss_points)[len(toss_points) // 2]
+        departure_x = max(abs(point.x - toss_center_x) for point in flight[1:])
+        # A serve must visibly leave the narrow toss column. This prevents a
+        # high vertical toss itself from being selected as the serve flight.
+        if departure_x <= max(10.0, toss["x_span_px"] * 1.5):
+            continue
+
+        launch_speed = math.hypot(
+            outbound_start.x - previous.x,
+            outbound_start.y - previous.y,
+        ) / gap
+        score = (
+            flight_stats["avg_speed"]
+            + flight_stats["distance"] / max(1, int(args.serve_window))
+            + launch_speed
+            + toss["vertical_motion_px"] * 0.10
+        )
+        transitions.append(
+            (
+                score,
+                {
+                    "contact": previous,
+                    "outbound_start": outbound_start,
+                    "flight_end": flight[-1],
+                    "flight_stats": flight_stats,
+                    "toss": toss,
+                    "launch_speed": launch_speed,
+                },
+            )
+        )
+
+    if not transitions:
+        serve.update(
+            {
+                "serve_type": "unknown",
+                "contact_captured": False,
+                "contact_detection_reason": "no compact vertical toss-to-flight transition was visible",
+                "flight_start_frame": int(serve["frame"]),
+                "flight_start_x": float(serve["x"]),
+                "flight_start_y": float(serve["y"]),
+                "toss": None,
+            }
+        )
+        return serve
+
+    _score, transition = max(transitions, key=lambda item: item[0])
+    contact: BallPoint = transition["contact"]
+    outbound_start: BallPoint = transition["outbound_start"]
+    flight_end: BallPoint = transition["flight_end"]
+    flight_stats = transition["flight_stats"]
+    toss = transition["toss"]
+
+    serve_type, type_reason = classify_serve_type(toss, flight_stats, args)
+
+    serve.update(
+        {
+            "frame": contact.frame,
+            "x": contact.x,
+            "y": contact.y,
+            "window_end_frame": flight_end.frame,
+            "window_end_x": flight_end.x,
+            "window_end_y": flight_end.y,
+            "direction": "toward_near_team" if flight_stats["y_speed"] > 0 else "toward_far_team",
+            "y_speed_px_per_frame": flight_stats["y_speed"],
+            "avg_speed_px_per_frame": flight_stats["avg_speed"],
+            "total_distance_px": flight_stats["distance"],
+            "mean_angle_change_deg": flight_stats["mean_angle_change"],
+            "serve_type": serve_type,
+            "serve_type_reason": type_reason,
+            "contact_captured": True,
+            "contact_detection_reason": "last compact toss point before outbound flight",
+            "flight_start_frame": outbound_start.frame,
+            "flight_start_x": outbound_start.x,
+            "flight_start_y": outbound_start.y,
+            "contact_to_flight_gap_frames": outbound_start.frame - contact.frame,
+            "contact_launch_speed_px_per_frame": transition["launch_speed"],
+            "toss": toss,
+        }
+    )
+    return serve
+
+
+def classify_serve_type(
+    toss: dict[str, Any],
+    flight_stats: dict[str, float],
+    args: argparse.Namespace,
+) -> tuple[str, str]:
+    partial_toss = not bool(toss["complete_arc"])
+    if toss["vertical_range_px"] >= float(args.serve_power_toss_min_height):
+        return "power", "high compact vertical toss"
+    if (
+        partial_toss
+        and toss["vertical_range_px"] >= float(args.serve_power_toss_min_height) * 0.5
+        and flight_stats["avg_speed"] >= float(args.serve_power_min_speed)
+    ):
+        return "power", "partial compact toss plus fast outbound flight"
+    return "floater", "compact low toss without power-serve height/speed evidence"
+
+
+def compact_toss_suffix(
+    points: list[BallPoint],
+    end_frame: int,
+    max_frames: int,
+    max_x_drift: float,
+) -> list[BallPoint]:
+    """Return the longest recent suffix that remains in a narrow x column."""
+
+    eligible = [
+        point
+        for point in points
+        if end_frame - max_frames <= point.frame <= end_frame
+    ]
+    if not eligible:
+        return []
+    best = [eligible[-1]]
+    for start in range(len(eligible) - 1, -1, -1):
+        suffix = eligible[start:]
+        xs = [point.x for point in suffix]
+        if max(xs) - min(xs) <= max_x_drift:
+            best = suffix
+        else:
+            break
+    return best
+
+
+def serve_toss_stats(points: list[BallPoint]) -> dict[str, Any]:
+    xs = [point.x for point in points]
+    ys = [point.y for point in points]
+    apex_index = min(range(len(points)), key=lambda index: points[index].y)
+    apex = points[apex_index]
+    rise = max(0.0, points[0].y - apex.y)
+    fall = max(0.0, points[-1].y - apex.y)
+    vertical_motion = sum(abs(cur.y - prev.y) for prev, cur in zip(points, points[1:]))
+    horizontal_motion = sum(abs(cur.x - prev.x) for prev, cur in zip(points, points[1:]))
+    arc_threshold = max(3.0, (max(ys) - min(ys)) * 0.15)
+    return {
+        "start_frame": points[0].frame,
+        "end_frame": points[-1].frame,
+        "apex_frame": apex.frame,
+        "point_count": len(points),
+        "x_span_px": max(xs) - min(xs),
+        "vertical_range_px": max(ys) - min(ys),
+        "vertical_motion_px": vertical_motion,
+        "horizontal_motion_px": horizontal_motion,
+        "vertical_to_horizontal_motion_ratio": vertical_motion / max(1.0, horizontal_motion),
+        "rise_px": rise,
+        "fall_px": fall,
+        "complete_arc": rise >= arc_threshold and fall >= arc_threshold,
+        "phase": "up_and_down" if rise >= arc_threshold and fall >= arc_threshold else "partial",
+    }
 
 
 def detect_reception_candidates(points: list[BallPoint], args: argparse.Namespace) -> list[dict[str, Any]]:
@@ -1247,6 +1920,10 @@ def detect_reception_candidates(points: list[BallPoint], args: argparse.Namespac
         before = nearest_point(by_frame, point.frame - args.reception_window, -1, args.reception_window * 2)
         after = nearest_point(by_frame, point.frame + args.reception_window, 1, args.reception_window * 2)
         if before is None or after is None or before.frame >= point.frame or after.frame <= point.frame:
+            continue
+        if point.tracklet_id is not None and (
+            before.tracklet_id != point.tracklet_id or after.tracklet_id != point.tracklet_id
+        ):
             continue
 
         vx_before = (point.x - before.x) / max(1, point.frame - before.frame)
@@ -1347,6 +2024,7 @@ def estimate_direction_change_moment(
         by_frame[item]
         for item in range(frame - window * 2, frame + window * 2 + 1)
         if item in by_frame
+        and (center.tracklet_id is None or by_frame[item].tracklet_id == center.tracklet_id)
     ]
     if len(local_points) < 3:
         return DirectionChangeMoment(center, float(center.frame), center.frame, center.frame, False)
@@ -1508,6 +2186,133 @@ def find_receiver(
     return result
 
 
+def find_serve_contact_player(
+    cv2: Any,
+    video_path: Path,
+    player_boxes_by_frame: dict[int, list[PlayerBox]],
+    ball_x: float,
+    ball_y: float,
+    contact_frame: int,
+    serving_team: str,
+    frame_window: int,
+    max_distance: float,
+    pose_classifier: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Associate a serve contact against all teams without identity bias.
+
+    Reception scoring may intentionally contain only near-team boxes.  Serve
+    contact association must not use that filtered view, and an unknown
+    opponent must not lose merely because a nearby receiver has a known jersey.
+    When MediaPipe is already enabled for action classification, visible wrist
+    landmarks are used instead of the coarse upper-box anchor.
+    """
+
+    candidates: list[tuple[float, int, PlayerBox, dict[str, Any]]] = []
+    frame_cache: dict[int, Any] = {}
+    for offset in range(-max(0, frame_window), max(0, frame_window) + 1):
+        frame_idx = contact_frame + offset
+        for box in player_boxes_by_frame.get(frame_idx, []):
+            ax, ay = box.upper_anchor
+            upper_distance = math.hypot(ball_x - ax, ball_y - ay)
+            anchor = {"x": ax, "y": ay, "method": "upper_box_anchor", "visibility": None}
+            distance = upper_distance
+
+            if pose_classifier is not None and upper_distance <= max_distance * 1.5:
+                frame = frame_cache.get(frame_idx)
+                if frame is None:
+                    frame = read_video_frame(cv2, video_path, frame_idx)
+                    frame_cache[frame_idx] = frame
+                wrist = closest_visible_wrist_to_ball(
+                    cv2=cv2,
+                    frame=frame,
+                    box=box,
+                    ball_x=ball_x,
+                    ball_y=ball_y,
+                    pose_classifier=pose_classifier,
+                )
+                if wrist is not None:
+                    distance = float(wrist["distance_px"])
+                    anchor = {
+                        "x": wrist["x"],
+                        "y": wrist["y"],
+                        "method": wrist["name"],
+                        "visibility": wrist["visibility"],
+                    }
+
+            if distance <= max_distance:
+                candidates.append((distance, abs(offset), box, anchor))
+
+    if not candidates:
+        return None
+
+    if serving_team == "far":
+        preferred = [item for item in candidates if item[2].team in {"opponent", "far"}]
+    elif serving_team == "near":
+        preferred = [item for item in candidates if item[2].team == "near"]
+    else:
+        preferred = []
+    if preferred:
+        candidates = preferred
+
+    distance, offset, box, anchor = min(
+        candidates,
+        key=lambda item: (item[0], item[1], 0 if item[2].observed else 1),
+    )
+    result = receiver_candidate_to_dict(box, distance, offset)
+    result.update(
+        {
+            "frame": box.frame,
+            "team": box.team,
+            "ball_x": ball_x,
+            "ball_y": ball_y,
+            "contact_anchor": anchor,
+            "association_method": "all_team_pose_wrist" if anchor["method"].endswith("wrist") else "all_team_upper_box",
+        }
+    )
+    return result
+
+
+def closest_visible_wrist_to_ball(
+    cv2: Any,
+    frame: Any,
+    box: PlayerBox,
+    ball_x: float,
+    ball_y: float,
+    pose_classifier: dict[str, Any],
+) -> dict[str, Any] | None:
+    if frame is None:
+        return None
+    pose_result = detect_pose_for_bbox(cv2, frame, box.bbox, pose_classifier["pose_estimator"])
+    if not pose_result.get("ok"):
+        return None
+    landmarks = pose_classifier["pose_dataset"].convert_landmarks(
+        pose_result["pose_landmarks"],
+        crop_origin=pose_result["crop_origin"],
+        crop_shape=pose_result["crop_shape"],
+        frame_shape=frame.shape,
+        bbox=box.bbox,
+    )
+    height, width = frame.shape[:2]
+    wrists = []
+    for point in landmarks:
+        name = str(point.get("name") or "")
+        visibility = float(point.get("visibility", 0.0) or 0.0)
+        if name not in {"left_wrist", "right_wrist"} or visibility < 0.15:
+            continue
+        x = float(point["x"]) * width
+        y = float(point["y"]) * height
+        wrists.append(
+            {
+                "name": name,
+                "x": x,
+                "y": y,
+                "visibility": visibility,
+                "distance_px": math.hypot(ball_x - x, ball_y - y),
+            }
+        )
+    return min(wrists, key=lambda item: item["distance_px"]) if wrists else None
+
+
 def receiver_candidate_to_dict(box: PlayerBox, distance: float, frame_offset: int) -> dict[str, Any]:
     x1, y1, x2, y2 = box.bbox
     ax, ay = box.upper_anchor
@@ -1532,6 +2337,7 @@ def segment_points(
     max_gap: int,
 ) -> list[BallPoint]:
     segment = []
+    tracklet_id = None
     frame = start_frame
     target_end = start_frame + window
     while frame <= target_end:
@@ -1539,8 +2345,12 @@ def segment_points(
         if point is None or point.frame > target_end:
             frame += 1
             continue
+        if segment and tracklet_id is not None and point.tracklet_id != tracklet_id:
+            break
         if not segment or point.frame > segment[-1].frame:
             segment.append(point)
+            if len(segment) == 1:
+                tracklet_id = point.tracklet_id
         frame = point.frame + 1
     return segment
 
@@ -1589,13 +2399,27 @@ def smooth_points(points: list[BallPoint]) -> list[BallPoint]:
     by_frame = {point.frame: point for point in points}
     smoothed = []
     for point in points:
-        neighbors = [by_frame[frame] for frame in range(point.frame - 2, point.frame + 3) if frame in by_frame]
+        neighbors = [
+            by_frame[frame]
+            for frame in range(point.frame - 2, point.frame + 3)
+            if frame in by_frame
+            and (point.tracklet_id is None or by_frame[frame].tracklet_id == point.tracklet_id)
+        ]
         if len(neighbors) < 3:
             smoothed.append(point)
             continue
         xs = sorted(item.x for item in neighbors)
         ys = sorted(item.y for item in neighbors)
-        smoothed.append(BallPoint(point.frame, xs[len(xs) // 2], ys[len(ys) // 2], point.radius, point.confidence))
+        smoothed.append(
+            BallPoint(
+                point.frame,
+                xs[len(xs) // 2],
+                ys[len(ys) // 2],
+                point.radius,
+                point.confidence,
+                point.tracklet_id,
+            )
+        )
     return smoothed
 
 
@@ -1749,7 +2573,9 @@ def write_annotated_video(
         boxes = latest_player_boxes_near_frame(player_tracks_by_id, frame_idx, player_draw_max_gap)
         if not boxes:
             boxes = player_boxes_by_frame.get(frame_idx, [])
-        draw_player_boxes(cv2, out, boxes, active_action)
+        serve_age = frame_idx - int(serve["frame"])
+        active_serve = serve if 0 <= serve_age <= label_hold_frames else None
+        draw_player_boxes(cv2, out, boxes, active_action, active_serve)
         draw_events(cv2, out, frame_idx, fps, serve, actions, active_action, label_hold_frames, reception_evaluation)
         writer.write(out)
     cap.release()
@@ -1780,7 +2606,12 @@ def draw_reception_zones(cv2: Any, frame: Any, zones: list[dict[str, Any]]) -> N
 
 
 def draw_ball(cv2: Any, frame: Any, frame_idx: int, ball: BallPoint | None, history: list[BallPoint], trail_length: int) -> None:
-    recent = [point for point in history[-trail_length:] if frame_idx - point.frame <= trail_length]
+    recent = [
+        point
+        for point in history
+        if 0 <= frame_idx - point.frame <= trail_length
+        and (ball is None or ball.tracklet_id is None or point.tracklet_id == ball.tracklet_id)
+    ][-trail_length:]
     for idx in range(1, len(recent)):
         prev = recent[idx - 1]
         cur = recent[idx]
@@ -1790,16 +2621,24 @@ def draw_ball(cv2: Any, frame: Any, frame_idx: int, ball: BallPoint | None, hist
 
 
 def active_action_for_frame(actions: list[dict[str, Any]], frame_idx: int, hold: int) -> dict[str, Any] | None:
-    active = [action for action in actions if abs(frame_idx - int(action["frame"])) <= hold]
+    active = [action for action in actions if 0 <= frame_idx - int(action["frame"]) <= hold]
     if not active:
         return None
     return min(active, key=lambda action: abs(frame_idx - int(action["frame"])))
 
 
-def draw_player_boxes(cv2: Any, frame: Any, boxes: list[PlayerBox], active_action: dict[str, Any] | None) -> None:
+def draw_player_boxes(
+    cv2: Any,
+    frame: Any,
+    boxes: list[PlayerBox],
+    active_action: dict[str, Any] | None,
+    active_serve: dict[str, Any] | None = None,
+) -> None:
     receiver = active_action.get("receiver") if active_action else None
     receiver_track = str(receiver.get("track_id")) if receiver else None
     receiver_pose_action = receiver.get("pose_action") if receiver else None
+    contact_player = active_serve.get("contact_player") if active_serve else None
+    server_track = str(contact_player.get("track_id")) if contact_player else None
     for box in boxes:
         x1, y1, x2, y2 = [int(value) for value in box.bbox]
         if receiver_track and box.track_id == receiver_track:
@@ -1810,7 +2649,8 @@ def draw_player_boxes(cv2: Any, frame: Any, boxes: list[PlayerBox], active_actio
             color = (255, 160, 0)
         else:
             color = (0, 215, 255)
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        thickness = 4 if server_track and box.track_id == server_track else 2
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
         ax, ay = box.upper_anchor
         cv2.circle(frame, (int(ax), int(ay)), 5, color, -1)
         if box.team == "opponent":
@@ -1819,6 +2659,8 @@ def draw_player_boxes(cv2: Any, frame: Any, boxes: list[PlayerBox], active_actio
             label = box.player_id
         else:
             label = f"unknown track_{box.track_id}"
+        if server_track and box.track_id == server_track:
+            label = f"SERVER {label}"
         if receiver_track and box.track_id == receiver_track and receiver_pose_action and receiver_pose_action.get("ok"):
             label = f"{label} {format_probability_vector(receiver_pose_action['probabilities'])}"
         draw_label(cv2, frame, label, x1, max(20, y1 - 8), color, 0.55)
@@ -1855,14 +2697,22 @@ def draw_events(
         pose_action = receiver.get("pose_action")
         if pose_action and pose_action.get("ok"):
             lines.append(f"action p: {format_probability_vector(pose_action['probabilities'])}")
+    contact_player = serve.get("contact_player") or {}
+    if contact_player:
+        server_label = contact_player.get("player_id") or f"track_{contact_player.get('track_id')}"
+        lines.append(f"server: {server_label} ({contact_player.get('team', 'unknown')})")
     for idx, line in enumerate(lines):
         draw_label(cv2, frame, line, 20, 35 + idx * 28, (0, 0, 255), 0.8)
 
-    if abs(frame_idx - int(serve["frame"])) <= hold:
+    if 0 <= frame_idx - int(serve["frame"]) <= hold:
         cv2.drawMarker(frame, (int(serve["x"]), int(serve["y"])), (255, 120, 0), cv2.MARKER_TILTED_CROSS, 42, 4)
-        draw_label(cv2, frame, "SERVE", int(serve["x"]) + 12, int(serve["y"]), (255, 120, 0), 0.75)
+        serve_type = str(serve.get("serve_type") or "unknown").upper()
+        label = f"{serve_type} SERVE" if serve_type != "UNKNOWN" else "SERVE FLIGHT START"
+        if not serve.get("contact_captured", False):
+            label += " (CONTACT NOT CAPTURED)"
+        draw_label(cv2, frame, label, int(serve["x"]) + 12, int(serve["y"]), (255, 120, 0), 0.75)
     for action in actions:
-        if abs(frame_idx - int(action["frame"])) <= hold:
+        if 0 <= frame_idx - int(action["frame"]) <= hold:
             if action.get("role") == "reception":
                 color = (0, 0, 255)
                 label = f"RECEPTION {action.get('reception_score', '')}".strip()
@@ -1874,6 +2724,18 @@ def draw_events(
                 label = str(action.get("action_type") or "ACTION").upper()
             cv2.drawMarker(frame, (int(action["x"]), int(action["y"])), color, cv2.MARKER_CROSS, 44, 4)
             draw_label(cv2, frame, label, int(action["x"]) + 12, int(action["y"]), color, 0.75)
+
+    pass_info = reception_evaluation.get("pass") or {}
+    origin = pass_info.get("origin_court_anchor") or {}
+    if origin:
+        origin_frame = int(origin.get("frame", pass_info.get("frame", 0)))
+        pass_frame = int(pass_info.get("frame", origin_frame))
+        if origin_frame <= frame_idx <= pass_frame + hold:
+            x, y = int(round(float(origin["x"]))), int(round(float(origin["y"])))
+            color = (255, 0, 255)
+            cv2.circle(frame, (x, y), 12, color, 3, cv2.LINE_AA)
+            cv2.drawMarker(frame, (x, y), color, cv2.MARKER_TILTED_CROSS, 26, 3)
+            draw_label(cv2, frame, "SETTER PASS/TAKEOFF POINT", x + 16, y - 12, color, 0.65)
 
 
 def draw_label(cv2: Any, frame: Any, text: str, x: int, y: int, color: tuple[int, int, int], scale: float) -> None:

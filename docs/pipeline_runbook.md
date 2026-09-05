@@ -191,8 +191,19 @@ Create a cleaned ball-only debug video and cleaned JSON. This applies jump filte
   --ball-track "$BALL_TRACK" \
   --ball-source vball-net \
   --max-ball-gap-sec 0 \
+  --post-serve-max-ball-gap-sec 0.20 \
   --ball-max-jump 100 \
   --ball-reset-gap-sec 0.17 \
+  --offline-ball-tracklet-filter \
+  --ball-tracklet-split-gap-sec 0.17 \
+  --ball-tracklet-min-duration-sec 0.20 \
+  --ball-tracklet-min-points 8 \
+  --ball-tracklet-min-distance 20 \
+  --ball-tracklet-max-link-speed 60 \
+  --ball-tracklet-max-speed 90 \
+  --ball-tracklet-max-acceleration 55 \
+  --ball-tracklet-max-mean-angle-change 90 \
+  --ball-tracklet-min-score 0.55 \
   --team-filter none \
   --tracker iou \
   --ocr off \
@@ -209,6 +220,8 @@ $CLEAN_OUT_DIR/${STEM}_test_tracking.csv
 ```
 
 Use `$CLEAN_BALL_TRACK` for the rest of the pipeline, not the raw `$BALL_TRACK`.
+
+The online stage remains strict before the serve because `--max-ball-gap-sec 0` disables general prediction. After sustained moving-ball evidence establishes the serve/rally flight, `--post-serve-max-ball-gap-sec 0.20` preserves short predicted trajectories through player occlusion. The offline filter protects credible post-serve tracklets containing these predictions, while still removing weak false prefixes. It splits at reset-sized gaps and implausible links, scores complete tracklets using duration, detection count, motion, smoothness, velocity, acceleration, rally continuation, and early serve/toss evidence. JSON and CSV ball records include `tracklet_id`; JSON also includes the scoring report and reacquisition boundaries.
 
 ## 8. Track All Players, Classify Teams, And Resolve Tracklets
 
@@ -290,8 +303,18 @@ This creates the final annotated rally video. It uses the cleaned ball track, th
   --ball-max-jump 100 \
   --ball-reset-gap-sec 0.17 \
   --serve-window-sec 0.47 \
+  --serve-toss-search-sec 1.50 \
+  --serve-contact-max-gap-sec 0.33 \
+  --serve-contact-flight-sec 1.00 \
+  --serve-contact-min-speed 4 \
+  --serve-contact-player-max-distance 220 \
+  --serve-toss-max-x-drift 80 \
+  --serve-toss-min-vertical-motion 6 \
+  --serve-toss-min-vertical-x-ratio 2.0 \
+  --serve-power-toss-min-height 70 \
+  --serve-power-min-speed 20 \
   --reception-window-sec 0.13 \
-  --reception-min-gap-sec 0.17 \
+  --reception-min-gap-sec 0 \
   --action-min-gap-sec 0.40 \
   --serve-min-speed 8 \
   --serve-min-distance 120 \
@@ -307,7 +330,9 @@ data/processed/rally_classification/${STEM}_serve_receive.json
 data/processed/rally_classification/${STEM}_reception_evaluation.json
 ```
 
-`--team-filter classified-near` uses only tracklets classified as the near team for action-to-player assignment. The final video still draws opposing tracks in red.
+Serve contact is resolved before reception candidates. A compact toss must be followed by a valid outbound flight; validation stops before the next strong trajectory change so the first reception remains available. Server association always searches all teams and uses MediaPipe wrists when the pose model is enabled. `--team-filter classified-near` is applied only to subsequent action-to-player assignment. The final video still draws opposing tracks in red.
+
+Serve contact detection separates a compact near-vertical toss from the outbound flight. A high toss is classified as `power`, a compact low toss as `floater`, and a clip without a visible toss-to-flight transition records `contact_captured=false` and `serve_type=unknown` instead of claiming that the flight-start frame is the contact.
 
 ## Volleydzen Tracking Ablation
 
@@ -336,8 +361,10 @@ Reproduce the scoring after running experiments:
 - `--ball-max-jump 100` rejects a ball detection if it jumps more than 100 pixels from the predicted position during continuous tracking.
 - Temporal thresholds use seconds and are converted to frame counts from each video's measured FPS. This keeps equivalent behavior at 30, 60, and 120 FPS.
 - `--ball-reset-gap-sec 0.17` resets ball state after approximately 0.17 seconds of missing or rejected detections, allowing reacquisition.
+- `--offline-ball-tracklet-filter` revisits complete ball tracklets after online filtering so a short false prefix is not retained merely because its points were locally consistent.
 - `--max-ball-gap-sec 0` disables filling missing ball time with predicted ball points.
-- `--reception-min-gap-sec 0.17` ignores trajectory changes immediately after the detected serve window. The default is about 5 frames at 30 FPS, 10 at 60 FPS, and 20 at 120 FPS.
+- `--post-serve-max-ball-gap-sec 0.20` overrides that strict setting only after a credible serve/rally flight is established, preserving up to about six predicted frames at 30 FPS when a player shields the ball.
+- `--reception-min-gap-sec 0` starts checking reception candidates immediately after the detected serve window. This avoids dropping a real contact that falls exactly on the old minimum-gap boundary.
 - The old frame options such as `--ball-reset-gap`, `--max-ball-gap`, `--serve-window`, and `--reception-min-frame-gap` remain as deprecated explicit overrides for older commands.
 - `--track-all-players` deliberately postpones team classification until after tracking.
 - `--tracker sportsmix` fuses motion/IoU with OSNet appearance and freezes appearance-template updates during overlap.
